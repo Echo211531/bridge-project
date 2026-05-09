@@ -3,6 +3,7 @@ package com.bridge.lifecycle.entity;
 import com.baomidou.mybatisplus.annotation.*;
 import lombok.Data;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 /**
@@ -27,18 +28,33 @@ public class BridgeAadtHistory {
     private String bridgeId;
 
     /**
-     * AADT值
+     * 旧AADT值
      */
-    private Integer aadt;
+    private Integer oldAadt;
 
     /**
-     * 数据来源
+     * 新AADT值
      */
-    private String source;
+    private Integer newAadt;
+
+    /**
+     * 旧β系数
+     */
+    private BigDecimal oldBetaCoef;
+
+    /**
+     * 新β系数
+     */
+    private BigDecimal newBetaCoef;
+
+    /**
+     * 变更原因
+     */
+    private String reason;
 
     /**
      * 变更时间
      */
     @TableField(fill = FieldFill.INSERT)
-    private LocalDateTime changedAt;
+    private LocalDateTime changeTime;
 }

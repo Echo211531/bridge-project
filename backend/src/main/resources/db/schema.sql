@@ -116,9 +116,12 @@ DROP TABLE IF EXISTS `bridge_aadt_history`;
 CREATE TABLE `bridge_aadt_history` (
   `id` VARCHAR(36) NOT NULL COMMENT '主键ID',
   `bridge_id` VARCHAR(36) NOT NULL COMMENT '桥梁ID',
-  `aadt` INT NOT NULL COMMENT 'AADT值',
-  `source` VARCHAR(50) COMMENT '数据来源',
-  `changed_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '变更时间',
+  `old_aadt` INT NOT NULL COMMENT '旧AADT值',
+  `new_aadt` INT NOT NULL COMMENT '新AADT值',
+  `old_beta_coef` DECIMAL(5,2) COMMENT '旧β系数',
+  `new_beta_coef` DECIMAL(5,2) COMMENT '新β系数',
+  `reason` VARCHAR(200) COMMENT '变更原因',
+  `change_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '变更时间',
   PRIMARY KEY (`id`),
   KEY `idx_bridge_id` (`bridge_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AADT历史记录表';
