@@ -1,0 +1,3683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>桥梁设备全生命周期管理系统</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #f0f2f5; }
+#root { min-height: 100vh; }
+.scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: #f1f5f9; }
+.fade-in { animation: fadeIn .3s ease-in; }
+@keyframes fadeIn { from {opacity:0;transform:translateY(8px);} to {opacity:1;transform:translateY(0);} }
+.bg-login {
+  background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 50%, #2563eb 100%);
+  position: relative;
+}
+.bg-login::before {
+  content:'';position:absolute;inset:0;
+  background-image:
+    radial-gradient(circle at 20% 30%, rgba(255,255,255,0.08) 0%, transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(255,255,255,0.06) 0%, transparent 50%);
+}
+table { border-collapse: collapse; }
+.transition-all { transition: all .25s ease; }
+input:focus, select:focus, textarea:focus { outline: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// ==================== 数据库层（IndexedDB - 模拟 MySQL 8） ====================
+const DB_NAME = 'bridge_mgr';
+const DB_VERSION = 1;
+let db = null;
+
+const TABLES = [
+  'sys_user',           // 用户表
+  'sys_role',           // 角色表
+  'sys_role_menu',      // 角色权限关联表
+  'sys_config',         // 系统配置（阈值参数）
+  'sys_audit_log',      // 审计日志
+  'bridge',             // 桥梁档案
+  'bridge_aadt_history',// AADT 历史
+  'monitoring_record',  // 外部监测推送记录
+  'device_archive',     // 设备档案
+  'device_category',    // 设备分类（含设计寿命/保养周期）
+  'maintain_plan',      // 保养计划
+  'maintain_record',    // 保养记录（运维上报）
+  'fault_order',        // 故障维修工单
+  'purchase_order',     // 采购订单（采购员模块）
+  'scrap_decision',     // 报废 TCO 决策记录
+  'scrap_approval',     // 报废审批
+  'lifecycle_event',    // 全生命周期事件流水
+];
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { db = req.result; resolve(db); };
+    req.onupgradeneeded = (e) => {
+      const _db = e.target.result;
+      TABLES.forEach(t => {
+        if (!_db.objectStoreNames.contains(t)) {
+          _db.createObjectStore(t, { keyPath: 'id' });
+        }
+      });
+    };
+  });
+}
+
+const dbApi = {
+  insert(table, row) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readwrite');
+      tx.objectStore(table).put(row);
+      tx.oncomplete = () => res(row);
+      tx.onerror = () => rej(tx.error);
+    });
+  },
+  bulkInsert(table, rows) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readwrite');
+      const store = tx.objectStore(table);
+      rows.forEach(r => store.put(r));
+      tx.oncomplete = () => res(rows.length);
+      tx.onerror = () => rej(tx.error);
+    });
+  },
+  update(table, row) { return this.insert(table, row); },
+  delete(table, id) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readwrite');
+      tx.objectStore(table).delete(id);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  },
+  get(table, id) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readonly');
+      const r = tx.objectStore(table).get(id);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  },
+  all(table) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readonly');
+      const r = tx.objectStore(table).getAll();
+      r.onsuccess = () => res(r.result || []);
+      r.onerror = () => rej(r.error);
+    });
+  },
+  async query(table, filter) {
+    const list = await this.all(table);
+    return filter ? list.filter(filter) : list;
+  },
+  count(table) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(table, 'readonly');
+      const r = tx.objectStore(table).count();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+};
+
+// ==================== 工具函数 ====================
+const uid = () => 'id_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const today = () => new Date().toISOString().slice(0, 10);
+const now = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+const fmtDate = (d) => d ? (typeof d === 'string' ? d.slice(0, 10) : d.toISOString().slice(0, 10)) : '';
+const fmtMoney = (n) => '¥' + (Number(n) || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
+const monthsBetween = (a, b) => { const aD = new Date(a), bD = new Date(b); return (bD.getFullYear()-aD.getFullYear())*12 + (bD.getMonth()-aD.getMonth()); };
+
+// 简单的密码哈希（演示用，模拟 BCrypt）
+const hashPwd = (s) => { let h = 0; for (let i=0;i<s.length;i++) h = ((h<<5)-h+s.charCodeAt(i))|0; return 'h_'+Math.abs(h).toString(36); };
+
+// 气候带 α 系数
+const CLIMATE_ZONES = {
+  coastal_humid:    { alpha: 0.70, label: '沿海高湿' },
+  temperate_normal: { alpha: 1.00, label: '温带常规' },
+  inland_dry:       { alpha: 1.10, label: '内陆干燥' },
+  cold_freeze:      { alpha: 0.85, label: '寒冷冻融' },
+  high_altitude:    { alpha: 0.80, label: '高海拔' },
+};
+const climateLabel = (k) => (CLIMATE_ZONES[k] || {}).label || k;
+const climateAlpha = (k) => (CLIMATE_ZONES[k] || {}).alpha || 1.0;
+
+// AADT → β 系数（阶梯映射）
+const aadtBeta = (aadt) => {
+  if (aadt <= 5000) return 1.20;
+  if (aadt <= 20000) return 1.00;
+  if (aadt <= 50000) return 0.78;
+  return 0.55;
+};
+
+// 设备分类（11 大类，与论文一致）
+const DEVICE_CATEGORIES = [
+  { code:'lighting',  name:'照明系统',  abbr:'LT', designLife:8,  maintainCycleDays:90  },
+  { code:'monitor',   name:'监测设备',  abbr:'MN', designLife:6,  maintainCycleDays:60  },
+  { code:'expansion', name:'伸缩缝',    abbr:'EX', designLife:15, maintainCycleDays:180 },
+  { code:'bearing',   name:'支座',      abbr:'BR', designLife:30, maintainCycleDays:365 },
+  { code:'guard',     name:'防护设施',  abbr:'GD', designLife:20, maintainCycleDays:180 },
+  { code:'drainage',  name:'排水设施',  abbr:'DR', designLife:15, maintainCycleDays:120 },
+  { code:'vms',       name:'信息发布',  abbr:'VM', designLife:8,  maintainCycleDays:90  },
+  { code:'power',     name:'供配电',    abbr:'PW', designLife:12, maintainCycleDays:180 },
+  { code:'traffic',   name:'通行控制',  abbr:'TC', designLife:10, maintainCycleDays:120 },
+  { code:'security',  name:'安防系统',  abbr:'SC', designLife:8,  maintainCycleDays:90  },
+  { code:'fire',      name:'消防系统',  abbr:'FR', designLife:10, maintainCycleDays:180 },
+];
+const catName = (c) => (DEVICE_CATEGORIES.find(x => x.code === c) || {}).name || c;
+const catCfg = (c) => DEVICE_CATEGORIES.find(x => x.code === c) || DEVICE_CATEGORIES[0];
+
+// 设备状态
+const DEVICE_STATUS = {
+  in_use:      { label:'使用中',   color:'bg-green-100 text-green-700' },
+  in_stock:    { label:'已入库',   color:'bg-blue-100 text-blue-700' },
+  maintaining: { label:'保养中',   color:'bg-amber-100 text-amber-700' },
+  fault:       { label:'故障中',   color:'bg-red-100 text-red-700' },
+  scrapped:    { label:'已报废',   color:'bg-gray-200 text-gray-600' },
+  disabled:    { label:'已停用',   color:'bg-gray-200 text-gray-600' },
+};
+
+// 角色定义（重点：导师强调的多角色）
+const ROLES = [
+  { code:'admin',      name:'系统管理员', color:'bg-red-100 text-red-700' },
+  { code:'engineer',   name:'工程管理人员', color:'bg-blue-100 text-blue-700' },
+  { code:'purchaser',  name:'采购人员',   color:'bg-purple-100 text-purple-700' },
+  { code:'maintainer', name:'运维人员',   color:'bg-cyan-100 text-cyan-700' },
+  { code:'scrap',      name:'报废鉴定员', color:'bg-orange-100 text-orange-700' },
+];
+const findRole = (code) => ROLES.find(r => r.code === code) || ROLES[0];
+
+// 全局上下文
+const AppContext = React.createContext(null);
+const useApp = () => React.useContext(AppContext);
+
+// ==================== 种子数据生成（5座桥+30+设备+大量历史数据） ====================
+async function seedDataIfEmpty() {
+  const userCount = await dbApi.count('sys_user');
+  if (userCount > 0) return false; // 已有数据
+
+  // 1. 角色
+  const roles = [
+    { id: 'role_admin',      code: 'admin',      name: '系统管理员',  desc: '拥有所有权限' },
+    { id: 'role_engineer',   code: 'engineer',   name: '工程管理人员', desc: '设备档案/保养计划/统计分析' },
+    { id: 'role_purchaser',  code: 'purchaser',  name: '采购人员',     desc: '采购订单、入库管理' },
+    { id: 'role_maintainer', code: 'maintainer', name: '运维人员',     desc: '保养记录、故障申报' },
+    { id: 'role_scrap',      code: 'scrap',      name: '报废鉴定员',   desc: 'TCO 决策、报废审批' },
+  ];
+  await dbApi.bulkInsert('sys_role', roles);
+
+  // 2. 用户（每个角色至少 1 个账号）
+  const users = [
+    { id:uid(), username:'admin',      password:hashPwd('admin123'),      real_name:'王志刚', role_code:'admin',      dept:'信息中心',      status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'engineer',   password:hashPwd('engineer123'),   real_name:'李建国', role_code:'engineer',   dept:'工程管理科',    status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'engineer2',  password:hashPwd('engineer123'),   real_name:'刘思敏', role_code:'engineer',   dept:'工程管理科',    status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'purchaser',  password:hashPwd('purchase123'),   real_name:'陈伟杰', role_code:'purchaser',  dept:'物资采购科',    status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'maintainer', password:hashPwd('maintain123'),   real_name:'赵小军', role_code:'maintainer', dept:'桥梁运维一队',  status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'maintainer2',password:hashPwd('maintain123'),   real_name:'张文博', role_code:'maintainer', dept:'桥梁运维二队',  status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'scrap',      password:hashPwd('scrap123'),      real_name:'周明远', role_code:'scrap',      dept:'设备鉴定中心',  status:1, last_login_at:null, create_time:now() },
+    { id:uid(), username:'frozen',     password:hashPwd('frozen'),        real_name:'测试冻结账户', role_code:'maintainer', dept:'测试',     status:0, last_login_at:null, create_time:now() },
+  ];
+  await dbApi.bulkInsert('sys_user', users);
+
+  // 3. 阈值配置
+  const configs = [
+    { id:'repair_residual_threshold', config_key:'repair_residual_threshold', config_value:'0.55', description:'修复费/残值阈值（0.30~0.80）', updated_by:'admin', updated_at:now() },
+    { id:'life_warning_ratio',         config_key:'life_warning_ratio',         config_value:'0.80', description:'寿命耗损警戒线（0.60~0.95）', updated_by:'admin', updated_at:now() },
+    { id:'market_discount_ratio',      config_key:'market_discount_ratio',      config_value:'0.80', description:'二手市场折扣系数（0.5~1.0）',   updated_by:'admin', updated_at:now() },
+  ];
+  await dbApi.bulkInsert('sys_config', configs);
+
+  // 4. 设备分类
+  const cats = DEVICE_CATEGORIES.map(c => ({ id: c.code, ...c }));
+  await dbApi.bulkInsert('device_category', cats);
+
+  // 5. 桥梁（5座，覆盖不同气候带）
+  const bridges = [
+    { id:uid(), bridge_code:'BR-GJYQ-001', bridge_name:'赣江一桥', province:'江西', city:'南昌',
+      climate_zone:'temperate_normal', aadt:24500, aadt_last_update:'2026-03-15', aadt_source:'人工统计',
+      external_monitoring_id:'SHM-GJYQ-001', open_to_traffic_date:'1995-08-01',
+      design_load_grade:'公路-Ⅰ级', responsible_dept:'南昌市公路管理局', purchase_price:185000000.00,
+      design_life_years:50, annual_maintain_cost:850000, target_life_years:60, is_deleted:0, create_time:now(), update_time:now() },
+    { id:uid(), bridge_code:'BR-PYHB-002', bridge_name:'鄱阳湖大桥', province:'江西', city:'九江',
+      climate_zone:'coastal_humid', aadt:18200, aadt_last_update:'2026-04-10', aadt_source:'SHM 推送',
+      external_monitoring_id:'SHM-PYHB-002', open_to_traffic_date:'2008-12-25',
+      design_load_grade:'公路-Ⅰ级', responsible_dept:'九江市公路管理局', purchase_price:420000000.00,
+      design_life_years:50, annual_maintain_cost:1200000, target_life_years:60, is_deleted:0, create_time:now(), update_time:now() },
+    { id:uid(), bridge_code:'BR-DTHQ-003', bridge_name:'东郭虎渠桥', province:'江西', city:'赣州',
+      climate_zone:'inland_dry', aadt:6800, aadt_last_update:'2025-02-20', aadt_source:'人工统计',
+      external_monitoring_id:null, open_to_traffic_date:'2015-06-30',
+      design_load_grade:'公路-Ⅱ级', responsible_dept:'赣州市公路管理局', purchase_price:62000000.00,
+      design_life_years:30, annual_maintain_cost:280000, target_life_years:35, is_deleted:0, create_time:now(), update_time:now() },
+    { id:uid(), bridge_code:'BR-XSGQ-004', bridge_name:'雪山高架桥', province:'四川', city:'阿坝',
+      climate_zone:'high_altitude', aadt:3200, aadt_last_update:'2026-01-08', aadt_source:'人工统计',
+      external_monitoring_id:'SHM-XSGQ-004', open_to_traffic_date:'2018-10-15',
+      design_load_grade:'公路-Ⅱ级', responsible_dept:'阿坝州交通局', purchase_price:98000000.00,
+      design_life_years:50, annual_maintain_cost:520000, target_life_years:55, is_deleted:0, create_time:now(), update_time:now() },
+    { id:uid(), bridge_code:'BR-HRBQ-005', bridge_name:'松花江北桥', province:'黑龙江', city:'哈尔滨',
+      climate_zone:'cold_freeze', aadt:31800, aadt_last_update:'2026-02-28', aadt_source:'SHM 推送',
+      external_monitoring_id:'SHM-HRBQ-005', open_to_traffic_date:'2002-11-20',
+      design_load_grade:'公路-Ⅰ级', responsible_dept:'哈尔滨市公路管理局', purchase_price:235000000.00,
+      design_life_years:50, annual_maintain_cost:1050000, target_life_years:55, is_deleted:0, create_time:now(), update_time:now() },
+  ];
+  await dbApi.bulkInsert('bridge', bridges);
+
+  // 6. AADT 历史记录
+  const aadtHistories = [];
+  bridges.forEach(b => {
+    // 每个桥 3-5 条历史
+    const points = [
+      { date: addDays(b.aadt_last_update, -730), aadt: Math.round(b.aadt * 0.85), source: '年度统计' },
+      { date: addDays(b.aadt_last_update, -365), aadt: Math.round(b.aadt * 0.92), source: '年度统计' },
+      { date: addDays(b.aadt_last_update, -180), aadt: Math.round(b.aadt * 0.96), source: 'SHM 推送' },
+      { date: b.aadt_last_update,                aadt: b.aadt,                    source: b.aadt_source },
+    ];
+    points.forEach(p => {
+      aadtHistories.push({
+        id:uid(), bridge_id:b.id, aadt:p.aadt, source:p.source, operator:'admin',
+        changed_at: p.date + ' 09:00:00'
+      });
+    });
+  });
+  await dbApi.bulkInsert('bridge_aadt_history', aadtHistories);
+
+  // 7. 监测推送记录（最近 10 条）
+  const pushBridges = bridges.filter(b => b.external_monitoring_id);
+  const monitorings = [];
+  pushBridges.forEach(b => {
+    for (let i = 0; i < 3; i++) {
+      monitorings.push({
+        id:uid(), bridge_id:b.id, external_monitoring_id:b.external_monitoring_id,
+        reported_aadt: b.aadt + Math.round((Math.random()-0.5)*200),
+        source:'shm_push', pushed_at: addDays(today(), -i*30) + ' 08:15:00'
+      });
+    }
+  });
+  await dbApi.bulkInsert('monitoring_record', monitorings);
+
+  // 8. 设备档案（每座桥挂 6-9 台，共 30+ 台，覆盖多种状态/分类/年龄）
+  const devices = [];
+  const deviceCfg = [
+    // bridge_idx, [...{cat, name, year, cost, status?}]
+    [0, // 赣江一桥（老桥，设备多样）
+      { cat:'lighting',  name:'桥面 LED 路灯',     year:2018, cost:45000,  m:1200,  r:800 },
+      { cat:'lighting',  name:'桥面 LED 路灯（备）', year:2020, cost:48000,  m:1200,  r:600 },
+      { cat:'monitor',   name:'结构应变传感器',     year:2021, cost:120000, m:6000,  r:3000, ext_mon:true },
+      { cat:'expansion', name:'D80 模数式伸缩缝',   year:2008, cost:280000, m:8000,  r:25000 },
+      { cat:'bearing',   name:'盆式橡胶支座',       year:1995, cost:45000,  m:1500,  r:5500, status:'fault' },
+      { cat:'guard',     name:'波形护栏（北段）',   year:2010, cost:85000,  m:2500,  r:4500 },
+      { cat:'drainage',  name:'桥面集水盒（4#）',   year:2015, cost:8500,   m:600,   r:1200 },
+      { cat:'vms',       name:'F 型可变情报板',     year:2019, cost:185000, m:5500,  r:3500 },
+      { cat:'power',     name:'桥下配电柜（主）',   year:2012, cost:62000,  m:3000,  r:4500 },
+    ],
+    [1, // 鄱阳湖大桥（沿海高湿，腐蚀严重）
+      { cat:'lighting',  name:'桥塔泛光灯',         year:2015, cost:52000,  m:1800,  r:2200 },
+      { cat:'monitor',   name:'拉索索力传感器',     year:2020, cost:285000, m:9500,  r:5500, ext_mon:true },
+      { cat:'expansion', name:'D160 模数式伸缩缝',  year:2008, cost:480000, m:12000, r:35000 },
+      { cat:'bearing',   name:'摩擦摆式减隔震支座', year:2008, cost:185000, m:4500,  r:6500 },
+      { cat:'guard',     name:'防风障（迎风段）',   year:2014, cost:125000, m:4500,  r:8500, status:'maintaining' },
+      { cat:'drainage',  name:'桥面排水管系统',     year:2008, cost:62000,  m:2200,  r:3800 },
+      { cat:'security',  name:'高清网络摄像机',     year:2022, cost:18000,  m:600,   r:300 },
+      { cat:'power',     name:'变电所柜（高压）',   year:2008, cost:185000, m:5500,  r:6500 },
+    ],
+    [2, // 东郭虎渠桥（小桥，设备少）
+      { cat:'lighting',  name:'太阳能 LED 路灯',    year:2015, cost:6800,   m:200,   r:150 },
+      { cat:'guard',     name:'波形护栏',           year:2015, cost:48000,  m:1500,  r:2200 },
+      { cat:'drainage',  name:'桥面集水盒',         year:2015, cost:5200,   m:300,   r:600 },
+      { cat:'traffic',   name:'限重监测装置',       year:2020, cost:35000,  m:1500,  r:1200, status:'in_stock' },
+      { cat:'fire',      name:'消防应急装置',       year:2015, cost:18000,  m:800,   r:600 },
+    ],
+    [3, // 雪山高架桥（高海拔）
+      { cat:'lighting',  name:'高海拔加固路灯',     year:2018, cost:85000,  m:1800,  r:2800 },
+      { cat:'monitor',   name:'温度位移传感器',     year:2018, cost:135000, m:6500,  r:3200, ext_mon:true },
+      { cat:'expansion', name:'温度补偿伸缩缝',     year:2018, cost:325000, m:9500,  r:18000 },
+      { cat:'bearing',   name:'低温球形钢支座',     year:2018, cost:125000, m:3500,  r:4500 },
+      { cat:'guard',     name:'防雪护栏',           year:2018, cost:65000,  m:2200,  r:3500 },
+      { cat:'fire',      name:'低温消防系统',       year:2018, cost:52000,  m:1800,  r:1500, status:'fault' },
+    ],
+    [4, // 松花江北桥（寒冷冻融）
+      { cat:'lighting',  name:'高低温适应路灯',     year:2002, cost:38000,  m:1500,  r:2200, status:'scrapped' },
+      { cat:'lighting',  name:'新换 LED 路灯',      year:2024, cost:45000,  m:1100,  r:300  },
+      { cat:'monitor',   name:'结冰传感器',         year:2020, cost:95000,  m:4500,  r:2800, ext_mon:true },
+      { cat:'expansion', name:'D80 钢筋伸缩缝',     year:2002, cost:180000, m:6500,  r:42000 },
+      { cat:'bearing',   name:'盆式支座（南段）',   year:2002, cost:38000,  m:1200,  r:8500, status:'fault' },
+      { cat:'guard',     name:'防撞护栏',           year:2010, cost:95000,  m:3500,  r:6500 },
+      { cat:'drainage',  name:'防冻排水管',         year:2002, cost:62000,  m:2500,  r:8500 },
+      { cat:'power',     name:'箱式变压器',         year:2002, cost:185000, m:5500,  r:8500, status:'fault' },
+      { cat:'security',  name:'红外摄像机',         year:2022, cost:22000,  m:800,   r:400 },
+    ],
+  ];
+
+  let codeSeq = {};
+  deviceCfg.forEach(([bIdx, ...items]) => {
+    const bridge = bridges[bIdx];
+    items.forEach(item => {
+      const cat = catCfg(item.cat);
+      const key = `${bridge.bridge_code}-${cat.abbr}-${item.year}`;
+      codeSeq[key] = (codeSeq[key] || 0) + 1;
+      const code = `${key}-${String(codeSeq[key]).padStart(3,'0')}`;
+
+      const status = item.status || 'in_use';
+      const inUseDate = `${item.year}-06-15`;
+      const usedYears = (new Date() - new Date(inUseDate)) / (365.25 * 86400000);
+      const lifeRatio = usedYears / cat.designLife;
+
+      // 故障次数：年龄越大，故障越多；状态为 fault 时近期故障数加权
+      let faultCountMonth = 0;
+      let annualFaults = Math.max(0, Math.round(lifeRatio * 6 + (Math.random()-0.5)*2));
+      if (status === 'fault') faultCountMonth = 1 + Math.floor(Math.random()*2);
+
+      // 上次/下次保养
+      const cycleAlpha = climateAlpha(bridge.climate_zone);
+      const cycleBeta  = aadtBeta(bridge.aadt);
+      const cycleDays  = Math.round(cat.maintainCycleDays * cycleAlpha * cycleBeta);
+      const lastMaint  = addDays(today(), -Math.floor(Math.random() * cycleDays));
+      const nextMaint  = addDays(lastMaint, cycleDays);
+
+      devices.push({
+        id: uid(),
+        device_code: code,
+        device_name: item.name,
+        category: item.cat,
+        bridge_id: bridge.id,
+        status,
+        last_maintain_date: lastMaint,
+        next_maintain_date: nextMaint,
+        fault_count_month: faultCountMonth,
+        fault_count_year: annualFaults,
+        purchase_cost: item.cost,
+        annual_maintain_cost: item.m,
+        annual_repair_cost: item.r,
+        in_use_date: inUseDate,
+        design_life_years: cat.designLife,
+        external_monitoring: item.ext_mon ? 1 : 0,
+        spec: '型号 ' + (Math.random()*1000|0),
+        manufacturer: ['上海桥宏','北京路安','广东中通','南京交科','重庆基安'][Math.floor(Math.random()*5)],
+        is_deleted: 0,
+        create_time: inUseDate + ' 10:00:00',
+        update_time: now(),
+      });
+    });
+  });
+  await dbApi.bulkInsert('device_archive', devices);
+
+
+  // 9. 保养计划（每个使用中设备一份当前计划）
+  const plans = [];
+  devices.filter(d => ['in_use','fault','maintaining'].includes(d.status)).forEach(d => {
+    plans.push({
+      id:uid(), device_id:d.id, plan_date:d.next_maintain_date,
+      cycle_days: catCfg(d.category).maintainCycleDays,
+      status: new Date(d.next_maintain_date) < new Date() ? 'overdue' : 'pending',
+      assignee:'maintainer', create_time: now()
+    });
+  });
+  await dbApi.bulkInsert('maintain_plan', plans);
+
+  // 10. 保养记录（生成每个设备过去 1-3 年的若干保养记录，构建真实统计）
+  const maintainRecords = [];
+  devices.forEach(d => {
+    const inDate = new Date(d.in_use_date);
+    const monthsSpan = Math.min(monthsBetween(d.in_use_date, today()), 36); // 取最近 36 个月
+    const cycleDays = catCfg(d.category).maintainCycleDays;
+    const recordCount = Math.floor(monthsSpan * 30 / cycleDays);
+    for (let i = 0; i < recordCount; i++) {
+      const recordDate = addDays(today(), -(monthsSpan*30) + i * cycleDays);
+      if (new Date(recordDate) < inDate) continue;
+      maintainRecords.push({
+        id:uid(), device_id:d.id, bridge_id:d.bridge_id, category:d.category,
+        record_date: recordDate,
+        actual_cost: Math.round(d.annual_maintain_cost * cycleDays / 365 * (0.8 + Math.random()*0.4)),
+        manhour: 2 + Math.floor(Math.random()*4),
+        material: '常规耗材',
+        content: '例行' + catName(d.category) + '保养',
+        operator: 'maintainer',
+        photos: 0,
+        result: 'normal',
+        create_time: recordDate + ' 14:00:00'
+      });
+    }
+  });
+  await dbApi.bulkInsert('maintain_record', maintainRecords);
+
+  // 11. 故障维修工单
+  const faultOrders = [];
+  devices.forEach(d => {
+    const yearsInUse = Math.min(daysBetween(d.in_use_date, today()) / 365, 10);
+    const faultCount = Math.max(0, Math.round(yearsInUse * (d.fault_count_year || 1) / 3));
+    for (let i = 0; i < faultCount; i++) {
+      const faultDate = addDays(today(), -Math.floor(Math.random() * yearsInUse * 365));
+      if (new Date(faultDate) < new Date(d.in_use_date)) continue;
+      const isClosed = i > 0 || d.status !== 'fault';
+      const repairCost = Math.round(d.annual_repair_cost * (0.3 + Math.random()*0.7));
+      faultOrders.push({
+        id:uid(), device_id:d.id, bridge_id:d.bridge_id, category:d.category,
+        report_date: faultDate,
+        report_user: 'maintainer',
+        fault_desc: ['运行中出现异常噪音','检测数据偏离正常范围','外观出现明显损伤','功能失灵需立即修复'][Math.floor(Math.random()*4)],
+        repair_cost: isClosed ? repairCost : 0,
+        repair_user: isClosed ? 'maintainer' : null,
+        status: isClosed ? 'closed' : 'pending',
+        close_date: isClosed ? addDays(faultDate, Math.floor(Math.random()*5+1)) : null,
+        downtime_hours: isClosed ? (4 + Math.floor(Math.random()*44)) : null,
+        create_time: faultDate + ' 09:30:00'
+      });
+    }
+  });
+  await dbApi.bulkInsert('fault_order', faultOrders);
+
+  // 12. 采购订单（采购员模块）
+  const purchaseOrders = [
+    { id:uid(), order_no:'PO-2026-0001', bridge_id:bridges[0].id, category:'lighting',
+      device_name:'桥面 LED 路灯（追加 8 套）', spec:'250W IP66', quantity:8,
+      unit_price:48000, total_amount:384000, supplier:'上海桥宏照明有限公司',
+      status:'received', purchaser:'purchaser', order_date:'2026-01-15', receive_date:'2026-02-08', create_time:'2026-01-15 10:00:00' },
+    { id:uid(), order_no:'PO-2026-0002', bridge_id:bridges[4].id, category:'bearing',
+      device_name:'盆式橡胶支座更换件', spec:'GPZ(II)-3000', quantity:4,
+      unit_price:42000, total_amount:168000, supplier:'重庆基安桥梁工程',
+      status:'received', purchaser:'purchaser', order_date:'2026-02-20', receive_date:'2026-03-15', create_time:'2026-02-20 11:00:00' },
+    { id:uid(), order_no:'PO-2026-0003', bridge_id:bridges[1].id, category:'monitor',
+      device_name:'拉索索力补充传感器', spec:'GFRP-200T', quantity:6,
+      unit_price:285000, total_amount:1710000, supplier:'北京路安智能科技',
+      status:'in_transit', purchaser:'purchaser', order_date:'2026-03-25', receive_date:null, create_time:'2026-03-25 14:00:00' },
+    { id:uid(), order_no:'PO-2026-0004', bridge_id:bridges[3].id, category:'fire',
+      device_name:'低温消防应急装置', spec:'CDF-600（高寒）', quantity:1,
+      unit_price:65000, total_amount:65000, supplier:'广东中通消防',
+      status:'pending', purchaser:'purchaser', order_date:'2026-04-12', receive_date:null, create_time:'2026-04-12 16:00:00' },
+    { id:uid(), order_no:'PO-2026-0005', bridge_id:bridges[2].id, category:'traffic',
+      device_name:'限重监测装置（备用）', spec:'WIM-30T', quantity:1,
+      unit_price:35000, total_amount:35000, supplier:'南京交科电子',
+      status:'received', purchaser:'purchaser', order_date:'2026-04-20', receive_date:'2026-05-02', create_time:'2026-04-20 10:30:00' },
+  ];
+  await dbApi.bulkInsert('purchase_order', purchaseOrders);
+
+  // 13. 报废 TCO 决策记录（已完成的几条）
+  const scrapDecisions = [];
+  const scrappedDev = devices.find(d => d.status === 'scrapped');
+  if (scrappedDev) {
+    scrapDecisions.push({
+      id:uid(), equipment_id:scrappedDev.id, target_life_years:5, repair_estimate:18500,
+      current_residual:9500, threshold_triggered:1, tco_repair:42000, tco_replace:38500,
+      saving_diff:3500, recommendation:'建议报废（修复费已超过残值的 55%）',
+      decided_by:'scrap', decided_at:addDays(today(),-30)+' 14:00:00', status:'approved'
+    });
+  }
+  await dbApi.bulkInsert('scrap_decision', scrapDecisions);
+
+  // 14. 全生命周期事件流水（核心：体现"全生命周期"）
+  const events = [];
+  // 给每个设备生成生命周期事件链
+  devices.forEach(d => {
+    // 事件1：采购入库
+    events.push({
+      id:uid(), device_id:d.id, bridge_id:d.bridge_id,
+      event_type:'purchase', event_date:d.in_use_date,
+      title:'设备采购入库', detail:`${d.device_name} 采购入库，单价 ${fmtMoney(d.purchase_cost)}`,
+      operator:'purchaser', cost:d.purchase_cost, create_time:d.in_use_date+' 09:00:00'
+    });
+    // 事件2：投入使用
+    events.push({
+      id:uid(), device_id:d.id, bridge_id:d.bridge_id,
+      event_type:'commission', event_date:d.in_use_date,
+      title:'设备投入使用', detail:`${d.device_name} 安装并投入使用，预计设计寿命 ${d.design_life_years} 年`,
+      operator:'engineer', cost:0, create_time:d.in_use_date+' 15:00:00'
+    });
+  });
+  // 保养事件（来自 maintainRecords）
+  maintainRecords.forEach(m => {
+    const d = devices.find(x => x.id === m.device_id);
+    if (!d) return;
+    events.push({
+      id:uid(), device_id:m.device_id, bridge_id:m.bridge_id,
+      event_type:'maintain', event_date:m.record_date,
+      title:'例行保养', detail:`${d.device_name} 完成保养，工时 ${m.manhour}h，费用 ${fmtMoney(m.actual_cost)}`,
+      operator:m.operator, cost:m.actual_cost, create_time:m.create_time
+    });
+  });
+  // 维修事件（来自 faultOrders）
+  faultOrders.filter(f=>f.status==='closed').forEach(f => {
+    const d = devices.find(x => x.id === f.device_id);
+    if (!d) return;
+    events.push({
+      id:uid(), device_id:f.device_id, bridge_id:f.bridge_id,
+      event_type:'repair', event_date:f.close_date,
+      title:'故障修复', detail:`${d.device_name}：${f.fault_desc}；维修费用 ${fmtMoney(f.repair_cost)}`,
+      operator:f.repair_user, cost:f.repair_cost, create_time:f.close_date+' 10:00:00'
+    });
+  });
+  // 报废事件
+  if (scrappedDev) {
+    events.push({
+      id:uid(), device_id:scrappedDev.id, bridge_id:scrappedDev.bridge_id,
+      event_type:'scrap', event_date:addDays(today(),-30),
+      title:'设备报废', detail:`${scrappedDev.device_name}：TCO 决策触发阈值预警，建议报废并已审批通过`,
+      operator:'scrap', cost:0, create_time:addDays(today(),-30)+' 16:00:00'
+    });
+  }
+  await dbApi.bulkInsert('lifecycle_event', events);
+
+  // 15. 审计日志（初始化记录）
+  await dbApi.insert('sys_audit_log', {
+    id:uid(), operator:'system', operate_time:now(), client_ip:'127.0.0.1',
+    action:'INIT_DATA', target:'system', detail:'初始化演示数据：5座桥梁、'+devices.length+'台设备、'+maintainRecords.length+'条保养记录、'+faultOrders.length+'条故障工单、'+events.length+'条生命周期事件'
+  });
+
+  return true;
+}
+
+
+// ==================== 业务服务层（真实统计计算） ====================
+const services = {
+  async getConfig(key, defaultVal) {
+    const c = await dbApi.get('sys_config', key);
+    return c ? Number(c.config_value) : defaultVal;
+  },
+
+  // 当前估计残值（直线折旧 × 市场折扣）
+  async calcResidual(device) {
+    const mktDisc = await this.getConfig('market_discount_ratio', 0.80);
+    const usedYears = (Date.now() - new Date(device.in_use_date)) / (365.25 * 86400000);
+    const designLife = Math.max(1, device.design_life_years || 1);
+    const ratio = Math.max(0, 1 - usedYears / designLife);
+    return device.purchase_cost * ratio * mktDisc;
+  },
+
+  async calcUsedYears(device) {
+    return (Date.now() - new Date(device.in_use_date)) / (365.25 * 86400000);
+  },
+
+  // TCO 决策（论文核心算法 — 阈值前置 + 双方案对比）
+  async tcoDecision(deviceId, targetYears, repairEstimate) {
+    const device = await dbApi.get('device_archive', deviceId);
+    if (!device) throw new Error('设备不存在');
+    if (!device.purchase_cost || !device.in_use_date) throw new Error('档案信息不全');
+
+    const thr      = await this.getConfig('repair_residual_threshold', 0.55);
+    const mktDisc  = await this.getConfig('market_discount_ratio',     0.80);
+    const lifeWarn = await this.getConfig('life_warning_ratio',        0.80);
+
+    const usedYears = await this.calcUsedYears(device);
+    const designLife = Math.max(1, device.design_life_years);
+    const ratio = Math.max(0, 1 - usedYears / designLife);
+    const residual = device.purchase_cost * ratio * mktDisc;
+
+    const result = {
+      device_name: device.device_name,
+      device_code: device.device_code,
+      used_years: usedYears.toFixed(2),
+      design_life: designLife,
+      life_ratio: (usedYears / designLife * 100).toFixed(1),
+      current_residual: Math.round(residual * 100) / 100,
+      threshold: thr,
+      market_discount: mktDisc,
+      life_warning: lifeWarn,
+      repair_estimate: repairEstimate,
+      target_years: targetYears,
+    };
+
+    // 阈值前置判断
+    if (repairEstimate > residual * thr) {
+      result.threshold_triggered = true;
+      result.recommendation = `建议报废（修复费 ${fmtMoney(repairEstimate)} > 残值 ${fmtMoney(residual)} × ${(thr*100).toFixed(0)}%）`;
+      result.recommendation_short = '建议报废';
+      return result;
+    }
+
+    result.threshold_triggered = false;
+
+    // 修复方案 TCO
+    const annualOpCost = (device.annual_maintain_cost || 0) + (device.annual_repair_cost || 0);
+    const tcoRepair = repairEstimate + annualOpCost * targetYears;
+    result.tco_repair = Math.round(tcoRepair * 100) / 100;
+
+    // 更换方案 TCO
+    const newPrice = device.purchase_cost;
+    const tcoReplace = newPrice + (device.annual_maintain_cost || 0) * designLife - residual;
+    result.tco_replace = Math.round(tcoReplace * 100) / 100;
+
+    const diff = tcoRepair - tcoReplace;
+    result.saving_diff = Math.round(diff * 100) / 100;
+
+    // 寿命警戒线
+    if (usedYears / designLife >= lifeWarn) {
+      result.recommendation = '建议更换：设备已超过寿命警戒线（'+(lifeWarn*100).toFixed(0)+'%）';
+      result.recommendation_short = '建议更换';
+    } else if (diff > 0) {
+      result.recommendation = '建议更换：经济性更优（节省 '+fmtMoney(diff)+'）';
+      result.recommendation_short = '建议更换';
+    } else {
+      result.recommendation = '建议继续维修（修复方案更经济，节省 '+fmtMoney(-diff)+'）';
+      result.recommendation_short = '建议维修';
+    }
+    return result;
+  },
+
+  // 真实统计：首页仪表盘
+  async dashboardSummary() {
+    const devices = await dbApi.all('device_archive');
+    const activeDevices = devices.filter(d => !d.is_deleted && d.status !== 'scrapped');
+    const inUse = activeDevices.filter(d => d.status === 'in_use').length;
+
+    const faults = await dbApi.all('fault_order');
+    const today_d = new Date(today());
+    const monthStart = new Date(today_d.getFullYear(), today_d.getMonth(), 1).toISOString().slice(0,10);
+    const monthFaults = faults.filter(f => f.report_date >= monthStart).length;
+
+    // 待办：超期保养、待审批的报废、待处理工单
+    const overdueMaintain = activeDevices.filter(d =>
+      d.next_maintain_date && d.next_maintain_date < today() && d.status === 'in_use'
+    ).length;
+    const pendingScrap = (await dbApi.all('scrap_decision')).filter(s => s.status === 'pending').length;
+    const pendingFaults = faults.filter(f => f.status === 'pending').length;
+
+    // 状态分布
+    const statusDist = {};
+    devices.filter(d => !d.is_deleted).forEach(d => {
+      statusDist[d.status] = (statusDist[d.status] || 0) + 1;
+    });
+
+    // 近 30 天费用趋势（按天聚合）
+    const trends = {};
+    for (let i = 0; i < 30; i++) {
+      const d = addDays(today(), -29 + i);
+      trends[d] = { date: d, maintain: 0, repair: 0 };
+    }
+    const records = await dbApi.all('maintain_record');
+    records.forEach(r => {
+      if (trends[r.record_date]) trends[r.record_date].maintain += r.actual_cost || 0;
+    });
+    faults.filter(f=>f.status==='closed' && f.close_date).forEach(f => {
+      if (trends[f.close_date]) trends[f.close_date].repair += f.repair_cost || 0;
+    });
+
+    return {
+      totalDevices: activeDevices.length,
+      inUseDevices: inUse,
+      monthFaults,
+      pendingTotal: overdueMaintain + pendingScrap + pendingFaults,
+      overdueMaintain, pendingScrap, pendingFaults,
+      statusDist,
+      trends: Object.values(trends),
+    };
+  },
+
+  // 真实统计：分类分布、费用趋势、故障率、TCO 对比
+  async statsOverview(daysBack = 365) {
+    const devices = await dbApi.all('device_archive');
+    const records = await dbApi.all('maintain_record');
+    const faults = await dbApi.all('fault_order');
+    const purchases = await dbApi.all('purchase_order');
+
+    const startDate = addDays(today(), -daysBack);
+    const recsInRange = records.filter(r => r.record_date >= startDate);
+    const faultsInRange = faults.filter(f => f.report_date >= startDate);
+
+    // 1. 分类分布
+    const categoryCount = {};
+    DEVICE_CATEGORIES.forEach(c => categoryCount[c.code] = 0);
+    devices.filter(d => !d.is_deleted && d.status !== 'scrapped').forEach(d => {
+      categoryCount[d.category] = (categoryCount[d.category] || 0) + 1;
+    });
+
+    // 2. 费用趋势（按月）
+    const trendByMonth = {};
+    const monthsBack = Math.min(12, Math.ceil(daysBack / 30));
+    for (let i = monthsBack - 1; i >= 0; i--) {
+      const d = new Date(); d.setMonth(d.getMonth() - i);
+      const key = d.toISOString().slice(0,7);
+      trendByMonth[key] = { month: key, maintain: 0, repair: 0 };
+    }
+    recsInRange.forEach(r => {
+      const m = r.record_date.slice(0,7);
+      if (trendByMonth[m]) trendByMonth[m].maintain += r.actual_cost || 0;
+    });
+    faultsInRange.filter(f=>f.status==='closed').forEach(f => {
+      const m = (f.close_date||f.report_date).slice(0,7);
+      if (trendByMonth[m]) trendByMonth[m].repair += f.repair_cost || 0;
+    });
+
+    // 3. 故障率排行（按分类，真实计算 = 故障数/设备数）
+    const faultStats = {};
+    DEVICE_CATEGORIES.forEach(c => faultStats[c.code] = { total: 0, faults: 0 });
+    devices.filter(d=>!d.is_deleted).forEach(d => {
+      if (faultStats[d.category]) faultStats[d.category].total++;
+    });
+    faultsInRange.forEach(f => {
+      if (faultStats[f.category]) faultStats[f.category].faults++;
+    });
+    const faultRate = DEVICE_CATEGORIES.map(c => ({
+      category: c.code,
+      name: c.name,
+      total: faultStats[c.code].total,
+      faults: faultStats[c.code].faults,
+      rate: faultStats[c.code].total > 0
+        ? (faultStats[c.code].faults / faultStats[c.code].total * 100).toFixed(2)
+        : '0.00',
+    })).filter(x => x.total > 0).sort((a,b) => Number(b.rate) - Number(a.rate));
+
+    // 4. 分类 TCO 对比（采购+保养+维修）
+    const tcoByCat = {};
+    DEVICE_CATEGORIES.forEach(c => tcoByCat[c.code] = { name: c.name, purchase: 0, maintain: 0, repair: 0 });
+    devices.filter(d=>!d.is_deleted).forEach(d => {
+      if (tcoByCat[d.category]) tcoByCat[d.category].purchase += d.purchase_cost || 0;
+    });
+    records.forEach(r => { if (tcoByCat[r.category]) tcoByCat[r.category].maintain += r.actual_cost || 0; });
+    faults.filter(f=>f.status==='closed').forEach(f => {
+      if (tcoByCat[f.category]) tcoByCat[f.category].repair += f.repair_cost || 0;
+    });
+
+    return {
+      categoryCount,
+      trends: Object.values(trendByMonth),
+      faultRate,
+      tcoByCat: Object.entries(tcoByCat).filter(([k,v])=>v.purchase>0||v.maintain>0||v.repair>0).map(([k,v])=>({code:k,...v})),
+      // 关键指标率
+      stats: {
+        totalDevices: devices.filter(d=>!d.is_deleted).length,
+        activeDevices: devices.filter(d=>!d.is_deleted && d.status==='in_use').length,
+        // 在用率
+        utilizationRate: (() => {
+          const total = devices.filter(d=>!d.is_deleted).length;
+          const used = devices.filter(d=>!d.is_deleted && d.status==='in_use').length;
+          return total > 0 ? (used/total*100).toFixed(2) : '0.00';
+        })(),
+        // 完好率
+        intactRate: (() => {
+          const total = devices.filter(d=>!d.is_deleted).length;
+          const intact = devices.filter(d=>!d.is_deleted && ['in_use','in_stock'].includes(d.status)).length;
+          return total > 0 ? (intact/total*100).toFixed(2) : '0.00';
+        })(),
+        // 故障率（年化）
+        annualFaultRate: (() => {
+          const total = devices.filter(d=>!d.is_deleted).length;
+          const yearFaults = faults.filter(f => f.report_date >= addDays(today(), -365)).length;
+          return total > 0 ? (yearFaults/total*100).toFixed(2) : '0.00';
+        })(),
+        // 保养完成率（已完成保养记录数 / 应完成数 = 已完成/(plans 总数)）
+        maintainCompleteRate: (() => {
+          const ratio = recsInRange.length / Math.max(1, devices.filter(d=>!d.is_deleted&&d.status!=='scrapped').length * (daysBack/90));
+          return Math.min(100, ratio * 100).toFixed(2);
+        })(),
+        // 工单关闭率
+        faultCloseRate: (() => {
+          const closed = faultsInRange.filter(f=>f.status==='closed').length;
+          return faultsInRange.length > 0 ? (closed/faultsInRange.length*100).toFixed(2) : '0.00';
+        })(),
+        // 平均无故障运行时间 MTBF（小时） = 总运行小时 / 故障次数
+        mtbf: (() => {
+          const inUseCount = devices.filter(d=>!d.is_deleted && ['in_use','fault'].includes(d.status)).length;
+          const totalHours = inUseCount * (daysBack * 24);
+          const faultCount = faultsInRange.length;
+          return faultCount > 0 ? Math.round(totalHours / faultCount) : 0;
+        })(),
+        // 平均修复时间 MTTR（小时）
+        mttr: (() => {
+          const closed = faultsInRange.filter(f=>f.status==='closed' && f.downtime_hours);
+          if (closed.length === 0) return 0;
+          return Math.round(closed.reduce((s,f)=>s+f.downtime_hours,0) / closed.length);
+        })(),
+        // 累计采购金额
+        totalPurchase: purchases.filter(p=>p.status==='received').reduce((s,p)=>s+p.total_amount,0),
+        // 累计运维成本（保养+维修）
+        totalOpCost: recsInRange.reduce((s,r)=>s+(r.actual_cost||0),0) + faultsInRange.reduce((s,f)=>s+(f.repair_cost||0),0),
+      }
+    };
+  },
+
+  // 写审计日志
+  async log(operator, action, target, detail) {
+    return dbApi.insert('sys_audit_log', {
+      id:uid(), operator, operate_time:now(), client_ip:'127.0.0.1',
+      action, target: target||'', detail: typeof detail==='object' ? JSON.stringify(detail) : (detail||'')
+    });
+  },
+
+  // 写生命周期事件
+  async logLifecycle(deviceId, eventType, title, detail, operator, cost=0) {
+    const device = await dbApi.get('device_archive', deviceId);
+    return dbApi.insert('lifecycle_event', {
+      id:uid(), device_id:deviceId, bridge_id:device?.bridge_id,
+      event_type:eventType, event_date:today(),
+      title, detail, operator, cost, create_time:now()
+    });
+  },
+};
+
+
+// ==================== 通用 UI 组件 ====================
+let _msgId = 0;
+const Toast = {
+  list: [],
+  listeners: [],
+  show(type, msg) {
+    const id = ++_msgId;
+    this.list.push({ id, type, msg });
+    this.listeners.forEach(fn => fn([...this.list]));
+    setTimeout(() => {
+      this.list = this.list.filter(x => x.id !== id);
+      this.listeners.forEach(fn => fn([...this.list]));
+    }, 3000);
+  },
+  success(m) { this.show('success', m); },
+  error(m) { this.show('error', m); },
+  info(m) { this.show('info', m); },
+  warn(m) { this.show('warn', m); },
+};
+
+function ToastContainer() {
+  const [list, setList] = useState([]);
+  useEffect(() => {
+    Toast.listeners.push(setList);
+    return () => { Toast.listeners = Toast.listeners.filter(f => f !== setList); };
+  }, []);
+  const colors = {
+    success: 'bg-green-50 text-green-800 border-green-200',
+    error:   'bg-red-50 text-red-800 border-red-200',
+    info:    'bg-blue-50 text-blue-800 border-blue-200',
+    warn:    'bg-amber-50 text-amber-800 border-amber-200',
+  };
+  const icons = { success: '✓', error: '✕', info: 'ⓘ', warn: '!' };
+  return (
+    <div className="fixed top-5 right-5 z-[9999] space-y-2">
+      {list.map(t => (
+        <div key={t.id} className={`fade-in border rounded-lg px-4 py-3 shadow-md min-w-[280px] flex items-center gap-2 ${colors[t.type]}`}>
+          <span className="font-bold">{icons[t.type]}</span>
+          <span className="flex-1">{t.msg}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Modal({ open, title, children, onClose, width='600px', footer }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40 fade-in" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-2xl flex flex-col max-h-[90vh]" style={{width}} onClick={e=>e.stopPropagation()}>
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <div className="font-semibold text-gray-800">{title}</div>
+          <button className="text-gray-400 hover:text-gray-700 text-xl leading-none" onClick={onClose}>×</button>
+        </div>
+        <div className="px-5 py-4 overflow-auto scrollbar-thin flex-1">{children}</div>
+        {footer !== null && (
+          <div className="px-5 py-3 border-t bg-gray-50 flex justify-end gap-2">
+            {footer || <button className="px-4 py-1.5 bg-gray-100 rounded hover:bg-gray-200" onClick={onClose}>关闭</button>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Drawer({ open, title, children, onClose, width='640px' }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[1000] flex justify-end bg-black/40 fade-in" onClick={onClose}>
+      <div className="bg-white shadow-2xl flex flex-col h-full" style={{width}} onClick={e=>e.stopPropagation()}>
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <div className="font-semibold text-gray-800">{title}</div>
+          <button className="text-gray-400 hover:text-gray-700 text-xl" onClick={onClose}>×</button>
+        </div>
+        <div className="flex-1 overflow-auto scrollbar-thin">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Tag({ color='gray', children, className='' }) {
+  const map = {
+    green:'bg-green-100 text-green-700',
+    blue:'bg-blue-100 text-blue-700',
+    red:'bg-red-100 text-red-700',
+    amber:'bg-amber-100 text-amber-700',
+    gray:'bg-gray-100 text-gray-700',
+    purple:'bg-purple-100 text-purple-700',
+    cyan:'bg-cyan-100 text-cyan-700',
+  };
+  return <span className={`inline-block px-2 py-0.5 rounded text-xs ${map[color]||map.gray} ${className}`}>{children}</span>;
+}
+
+// 通用按钮
+function Btn({ type='default', size='sm', children, className='', ...rest }) {
+  const sizes = { sm:'px-3 py-1 text-sm', md:'px-4 py-1.5 text-sm', lg:'px-5 py-2' };
+  const types = {
+    primary: 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm',
+    success: 'bg-green-600 hover:bg-green-700 text-white shadow-sm',
+    danger:  'bg-red-600 hover:bg-red-700 text-white shadow-sm',
+    warn:    'bg-amber-500 hover:bg-amber-600 text-white shadow-sm',
+    default: 'bg-white border border-gray-300 hover:border-blue-500 hover:text-blue-600 text-gray-700',
+    text:    'text-blue-600 hover:text-blue-700 hover:underline',
+  };
+  return <button {...rest} className={`${sizes[size]} ${types[type]} rounded transition-all disabled:opacity-50 disabled:cursor-not-allowed ${className}`}>{children}</button>;
+}
+
+// 统计卡片
+function StatCard({ title, value, icon, color='blue', sub, onClick }) {
+  const colors = {
+    blue:   'from-blue-500 to-blue-600',
+    green:  'from-green-500 to-green-600',
+    amber:  'from-amber-500 to-orange-500',
+    red:    'from-red-500 to-pink-600',
+    purple: 'from-purple-500 to-indigo-600',
+    cyan:   'from-cyan-500 to-teal-600',
+  };
+  return (
+    <div className={`bg-gradient-to-br ${colors[color]} rounded-xl p-4 text-white shadow-md ${onClick?'cursor-pointer hover:shadow-lg':''} transition-all`} onClick={onClick}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-white/80 text-sm">{title}</span>
+        <span className="text-2xl opacity-80">{icon}</span>
+      </div>
+      <div className="text-3xl font-bold">{value}</div>
+      {sub && <div className="text-xs text-white/70 mt-1">{sub}</div>}
+    </div>
+  );
+}
+
+
+// ==================== 登录页 ====================
+function LoginPage({ onLogin }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState('');
+
+  const handleLogin = async (e) => {
+    if (e) e.preventDefault();
+    setError('');
+    if (!username.trim() || !password.trim()) {
+      setError('请输入账号和密码'); return;
+    }
+    setLoading(true);
+    try {
+      await new Promise(r => setTimeout(r, 400)); // 模拟网络
+      const users = await dbApi.all('sys_user');
+      const user = users.find(u => u.username === username.trim());
+      if (!user) { setError('账号不存在'); setPassword(''); return; }
+      if (user.status === 0) { setError('账号已被禁用，请联系管理员'); return; }
+      if (user.password !== hashPwd(password)) { setError('账号或密码不正确'); setPassword(''); return; }
+
+      // 更新最后登录时间
+      user.last_login_at = now();
+      await dbApi.update('sys_user', user);
+      await services.log(user.username, 'LOGIN', user.username, '用户登录成功');
+      Toast.success(`欢迎，${user.real_name}（${findRole(user.role_code).name}）`);
+      onLogin(user);
+    } catch (err) {
+      setError('登录失败：' + (err.message || '未知错误'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 一键填充测试账号
+  const fillAccount = (u, p) => { setUsername(u); setPassword(p); setError(''); };
+
+  return (
+    <div className="bg-login min-h-screen flex items-center justify-center p-4 relative">
+      <div className="absolute top-6 left-8 text-white">
+        <div className="text-xl font-bold">桥梁设备全生命周期管理系统</div>
+        <div className="text-xs text-white/70 mt-1">Bridge Equipment Lifecycle Management System</div>
+      </div>
+      <div className="absolute bottom-4 w-full text-center text-white/60 text-xs">
+        © 2026 华东交通大学 软件学院 · 程国忠 · 指导教师：向华萍
+      </div>
+
+      <div className="bg-white rounded-2xl shadow-2xl flex overflow-hidden relative z-10" style={{width:'820px',maxWidth:'95vw'}}>
+        {/* 左侧介绍 */}
+        <div className="bg-gradient-to-br from-blue-700 to-indigo-800 text-white p-8 flex-col justify-between hidden md:flex" style={{width:'40%'}}>
+          <div>
+            <div className="text-2xl mb-2">🌉</div>
+            <h2 className="text-xl font-bold mb-1">设备管理 一站到底</h2>
+            <p className="text-white/70 text-sm leading-6 mt-3">
+              覆盖桥梁附属设备从<br/>
+              <span className="text-yellow-300">采购入库 → 使用 → 保养 → 维修 → 报废</span><br/>
+              全过程，TCO 决策辅助让"修还是换"有据可依。
+            </p>
+          </div>
+          <div className="text-xs text-white/60 leading-6">
+            <div>· 5 类系统角色精细分权</div>
+            <div>· 全生命周期事件流水追溯</div>
+            <div>· TCO 阈值前置算法</div>
+            <div>· 8 项关键率真实计算</div>
+          </div>
+        </div>
+
+        {/* 右侧登录表单 */}
+        <div className="p-8 flex-1">
+          <div className="text-center mb-6">
+            <div className="text-2xl font-bold text-gray-800">用户登录</div>
+            <div className="text-sm text-gray-500 mt-1">请使用您的工作账号登录系统</div>
+          </div>
+
+          <form onSubmit={handleLogin} className="space-y-3">
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">账号</label>
+              <input
+                type="text"
+                value={username}
+                onChange={e=>setUsername(e.target.value)}
+                placeholder="请输入账号"
+                className="w-full px-3 py-2.5 border rounded-md focus:border-blue-500 transition-all"
+                autoComplete="off"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">密码</label>
+              <input
+                type="password"
+                value={password}
+                onChange={e=>setPassword(e.target.value)}
+                placeholder="请输入密码"
+                className="w-full px-3 py-2.5 border rounded-md focus:border-blue-500 transition-all"
+                autoComplete="off"
+              />
+            </div>
+            {error && (
+              <div className="text-red-600 text-sm bg-red-50 border border-red-200 rounded p-2 fade-in">⚠ {error}</div>
+            )}
+            <button
+              type="submit"
+              disabled={loading || !username || !password}
+              className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-2.5 rounded-md font-medium hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            >
+              {loading ? '登录中…' : '登 录'}
+            </button>
+          </form>
+
+          {/* 测试账号提示（毕设演示重点） */}
+          <div className="mt-6 pt-4 border-t">
+            <div className="text-xs text-gray-500 mb-2 flex items-center justify-between">
+              <span>🔑 测试账号一键登录（毕设答辩演示）</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <button type="button" className="border rounded px-2 py-1.5 hover:bg-red-50 hover:border-red-300 text-left" onClick={()=>fillAccount('admin','admin123')}>
+                <div className="font-medium text-red-600">系统管理员</div>
+                <div className="text-gray-500">admin / admin123</div>
+              </button>
+              <button type="button" className="border rounded px-2 py-1.5 hover:bg-blue-50 hover:border-blue-300 text-left" onClick={()=>fillAccount('engineer','engineer123')}>
+                <div className="font-medium text-blue-700">工程管理人员</div>
+                <div className="text-gray-500">engineer / engineer123</div>
+              </button>
+              <button type="button" className="border rounded px-2 py-1.5 hover:bg-purple-50 hover:border-purple-300 text-left" onClick={()=>fillAccount('purchaser','purchase123')}>
+                <div className="font-medium text-purple-700">采购人员</div>
+                <div className="text-gray-500">purchaser / purchase123</div>
+              </button>
+              <button type="button" className="border rounded px-2 py-1.5 hover:bg-cyan-50 hover:border-cyan-300 text-left" onClick={()=>fillAccount('maintainer','maintain123')}>
+                <div className="font-medium text-cyan-700">运维人员</div>
+                <div className="text-gray-500">maintainer / maintain123</div>
+              </button>
+              <button type="button" className="border rounded px-2 py-1.5 hover:bg-orange-50 hover:border-orange-300 col-span-2 text-left" onClick={()=>fillAccount('scrap','scrap123')}>
+                <div className="font-medium text-orange-700">报废鉴定员</div>
+                <div className="text-gray-500">scrap / scrap123</div>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ==================== 侧边栏菜单（按角色显示不同菜单） ====================
+const ALL_MENUS = [
+  { code:'dashboard',  name:'首页仪表盘',     icon:'📊', roles:['admin','engineer','purchaser','maintainer','scrap'] },
+  { code:'lifecycle',  name:'全生命周期',     icon:'♻️', roles:['admin','engineer','scrap'] },
+  { code:'bridges',    name:'桥梁基础参数',   icon:'🌉', roles:['admin','engineer'] },
+  { code:'devices',    name:'设备档案管理',   icon:'⚙️', roles:['admin','engineer','maintainer','scrap'] },
+  { code:'maintain',   name:'保养计划管理',   icon:'🔧', roles:['admin','engineer','maintainer'] },
+  { code:'fault',      name:'故障维修工单',   icon:'🚨', roles:['admin','engineer','maintainer'] },
+  { code:'purchase',   name:'采购入库',       icon:'📦', roles:['admin','engineer','purchaser'] },
+  { code:'scrap',      name:'报废技术鉴定',   icon:'🗑️', roles:['admin','engineer','scrap'] },
+  { code:'stats',      name:'统计分析',       icon:'📈', roles:['admin','engineer'] },
+  { code:'config',     name:'阈值参数配置',   icon:'⚖️', roles:['admin'] },
+  { code:'users',      name:'用户与角色',     icon:'👥', roles:['admin'] },
+  { code:'audit',      name:'审计日志',       icon:'📜', roles:['admin'] },
+];
+
+function Sidebar() {
+  const { user, menu: current, setMenu, logout } = useApp();
+  const menus = ALL_MENUS.filter(m => m.roles.includes(user.role_code));
+  const role = findRole(user.role_code);
+
+  return (
+    <div className="w-60 bg-gradient-to-b from-slate-800 to-slate-900 text-white flex flex-col h-screen">
+      <div className="p-4 border-b border-slate-700">
+        <div className="flex items-center gap-2">
+          <span className="text-2xl">🌉</span>
+          <div>
+            <div className="text-sm font-bold">桥梁设备管理系统</div>
+            <div className="text-[10px] text-slate-400">v1.0 · 全生命周期</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2">
+        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-sm font-bold">
+          {(user.real_name || user.username)[0]}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm truncate">{user.real_name || user.username}</div>
+          <div className="text-[10px] text-slate-400">{role.name}</div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto scrollbar-thin py-2">
+        {menus.map(m => (
+          <button
+            key={m.code}
+            onClick={() => setMenu(m.code)}
+            className={`w-full text-left px-4 py-2.5 flex items-center gap-3 transition-all hover:bg-slate-700/60 ${current===m.code?'bg-blue-600 hover:bg-blue-600 border-l-4 border-blue-300':''}`}
+          >
+            <span className="text-base">{m.icon}</span>
+            <span className="text-sm">{m.name}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="p-3 border-t border-slate-700 text-[10px] text-slate-500">
+        共 {menus.length} 个菜单 · 当前角色权限范围
+      </div>
+    </div>
+  );
+}
+
+// 通用 ECharts 容器
+function Chart({ option, height='280px', className='' }) {
+  const ref = useRef(null);
+  const inst = useRef(null);
+  useEffect(() => {
+    if (ref.current && !inst.current) {
+      inst.current = echarts.init(ref.current);
+    }
+    if (inst.current && option) {
+      inst.current.setOption(option, true);
+    }
+    const onResize = () => inst.current?.resize();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [option]);
+  useEffect(() => () => { inst.current?.dispose(); inst.current = null; }, []);
+  return <div ref={ref} style={{height,width:'100%'}} className={className} />;
+}
+
+
+// ==================== 首页仪表盘 ====================
+function DashboardPage() {
+  const { user } = useApp();
+  const [data, setData] = useState(null);
+  const [stats, setStats] = useState(null);
+
+  const reload = useCallback(async () => {
+    setData(await services.dashboardSummary());
+    setStats(await services.statsOverview(365));
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (!data || !stats) return <div className="p-6 text-center text-gray-400">加载中…</div>;
+
+  // 状态分布饼图
+  const statusOption = {
+    tooltip:{trigger:'item'},
+    legend:{bottom:0,textStyle:{fontSize:11}},
+    series:[{
+      type:'pie',
+      radius:['50%','75%'],
+      avoidLabelOverlap:false,
+      label:{show:true,formatter:'{b}\n{c}台'},
+      data: Object.entries(data.statusDist).map(([k,v]) => ({
+        name: DEVICE_STATUS[k]?.label || k, value: v
+      }))
+    }]
+  };
+
+  // 30 天趋势
+  const trendOption = {
+    tooltip:{trigger:'axis'},
+    legend:{data:['保养费','维修费'],top:0,textStyle:{fontSize:11}},
+    grid:{left:50,right:20,bottom:25,top:30},
+    xAxis:{type:'category',data:data.trends.map(t=>t.date.slice(5)),axisLabel:{fontSize:10,interval:Math.floor(data.trends.length/8)}},
+    yAxis:{type:'value',axisLabel:{formatter:'¥{value}',fontSize:10}},
+    series:[
+      { name:'保养费', type:'line', smooth:true, areaStyle:{opacity:0.3}, itemStyle:{color:'#10b981'},
+        data:data.trends.map(t=>t.maintain) },
+      { name:'维修费', type:'line', smooth:true, areaStyle:{opacity:0.3}, itemStyle:{color:'#ef4444'},
+        data:data.trends.map(t=>t.repair) },
+    ]
+  };
+
+  return (
+    <div className="p-6 space-y-6 fade-in">
+      {/* 关键指标卡片 */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <StatCard title="设备总量" value={data.totalDevices} icon="⚙️" color="blue" sub={`使用中 ${data.inUseDevices} 台`} />
+        <StatCard title="本月新增故障" value={data.monthFaults} icon="🚨" color="red" sub="待及时处理" />
+        <StatCard title="待办事项" value={data.pendingTotal} icon="📋" color="amber"
+          sub={`超期保养 ${data.overdueMaintain} · 待审 ${data.pendingScrap+data.pendingFaults}`}/>
+        <StatCard title="设备完好率" value={stats.stats.intactRate+'%'} icon="✅" color="green" sub="（在用+在库）/总数"/>
+      </div>
+
+      {/* 8 项关键统计率（导师强调"真实算出来"） */}
+      <div className="bg-white rounded-xl p-5 shadow-sm">
+        <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+          <span>📊 关键运行指标</span>
+          <span className="text-xs font-normal text-gray-400">基于真实业务数据计算</span>
+        </h3>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { label:'设备在用率',     value:stats.stats.utilizationRate+'%', desc:'在用/(在用+在库+故障+保养)', color:'text-blue-600' },
+            { label:'设备完好率',     value:stats.stats.intactRate+'%',      desc:'(在用+在库)/总设备数', color:'text-green-600' },
+            { label:'年故障率',       value:stats.stats.annualFaultRate+'%', desc:'近 1 年故障数/设备数', color:'text-red-600' },
+            { label:'保养完成率',     value:stats.stats.maintainCompleteRate+'%', desc:'实际保养/计划保养', color:'text-cyan-600' },
+            { label:'工单关闭率',     value:stats.stats.faultCloseRate+'%',  desc:'已关闭/总工单数', color:'text-purple-600' },
+            { label:'平均无故障 MTBF', value:stats.stats.mtbf+' h',          desc:'总运行/故障次数', color:'text-indigo-600' },
+            { label:'平均修复 MTTR',  value:stats.stats.mttr+' h',          desc:'累计停机/故障数', color:'text-orange-600' },
+            { label:'累计运维成本',   value:fmtMoney(stats.stats.totalOpCost), desc:'保养+维修', color:'text-rose-600' },
+          ].map(s => (
+            <div key={s.label} className="border rounded-lg p-3 hover:shadow-md transition-all">
+              <div className="text-xs text-gray-500">{s.label}</div>
+              <div className={`text-xl font-bold mt-1 ${s.color}`}>{s.value}</div>
+              <div className="text-[10px] text-gray-400 mt-1">{s.desc}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl p-5 shadow-sm">
+          <h3 className="font-semibold text-gray-800 mb-3">设备状态分布</h3>
+          <Chart option={statusOption} height="260px"/>
+        </div>
+        <div className="bg-white rounded-xl p-5 shadow-sm">
+          <h3 className="font-semibold text-gray-800 mb-3">近 30 天费用趋势</h3>
+          <Chart option={trendOption} height="260px"/>
+        </div>
+      </div>
+
+      {/* 待办事项 */}
+      <div className="bg-white rounded-xl p-5 shadow-sm">
+        <h3 className="font-semibold text-gray-800 mb-3">📌 待办事项</h3>
+        <TodoList />
+      </div>
+    </div>
+  );
+}
+
+function TodoList() {
+  const [todos, setTodos] = useState([]);
+  const { setMenu } = useApp();
+  useEffect(() => { (async () => {
+    const devices = await dbApi.all('device_archive');
+    const faults = await dbApi.all('fault_order');
+    const scraps = await dbApi.all('scrap_decision');
+
+    const list = [];
+    // 超期保养
+    devices.filter(d => !d.is_deleted && d.next_maintain_date && d.next_maintain_date < today() && d.status === 'in_use')
+      .slice(0,5).forEach(d => list.push({
+        type:'保养超期', title: d.device_name+' ('+d.device_code+')',
+        desc:'计划保养日期 '+d.next_maintain_date+'，已超期 '+daysBetween(d.next_maintain_date, today())+' 天',
+        color:'red', goto:'maintain'
+      }));
+    // 待处理故障
+    faults.filter(f => f.status === 'pending').slice(0,3).forEach(f => {
+      const d = devices.find(x => x.id === f.device_id);
+      if (d) list.push({
+        type:'待处理故障', title: d.device_name+'：'+f.fault_desc,
+        desc:'报修日期 '+f.report_date+'，请尽快处理',
+        color:'amber', goto:'fault'
+      });
+    });
+    // 待审批报废
+    scraps.filter(s => s.status === 'pending').forEach(s => {
+      list.push({ type:'待审报废', title:'报废决策 '+s.id.slice(-8), desc:'TCO 决策已提交，待审批',
+        color:'purple', goto:'scrap' });
+    });
+    setTodos(list);
+  })(); }, []);
+
+  if (todos.length === 0) return <div className="text-gray-400 text-center py-6 text-sm">暂无待办事项 ✓</div>;
+  return (
+    <div className="space-y-2">
+      {todos.map((t,i) => (
+        <div key={i} className="flex items-center justify-between p-3 border rounded-lg hover:shadow-sm transition-all">
+          <div className="flex items-center gap-3 flex-1 min-w-0">
+            <Tag color={t.color}>{t.type}</Tag>
+            <div className="min-w-0">
+              <div className="text-sm font-medium truncate">{t.title}</div>
+              <div className="text-xs text-gray-500">{t.desc}</div>
+            </div>
+          </div>
+          <Btn type="text" onClick={()=>setMenu(t.goto)}>去处理 →</Btn>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+// ==================== 全生命周期管理（核心：导师强调） ====================
+function LifecyclePage() {
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [keyword, setKeyword] = useState('');
+  const [bridgeFilter, setBridgeFilter] = useState('');
+
+  const reload = useCallback(async () => {
+    setDevices(await dbApi.all('device_archive'));
+    setBridges(await dbApi.all('bridge'));
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const filtered = useMemo(() => {
+    return devices.filter(d => !d.is_deleted)
+      .filter(d => !keyword || d.device_name.includes(keyword) || d.device_code.includes(keyword))
+      .filter(d => !bridgeFilter || d.bridge_id === bridgeFilter);
+  }, [devices, keyword, bridgeFilter]);
+
+  return (
+    <div className="p-6 fade-in">
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+        <div className="font-medium text-blue-900 flex items-center gap-2">
+          <span className="text-xl">♻️</span>设备全生命周期视图
+        </div>
+        <div className="text-xs text-blue-700 mt-1">
+          覆盖每台设备从 <b>采购入库 → 投入使用 → 例行保养 → 故障维修 → 报废处置</b> 的全过程事件流水。
+          点击任意设备查看其完整生命周期时间轴。
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        <div className="p-4 border-b flex flex-wrap gap-2 items-center">
+          <input className="border rounded px-3 py-1.5 text-sm" placeholder="搜索设备名/编码"
+            value={keyword} onChange={e=>setKeyword(e.target.value)}/>
+          <select className="border rounded px-3 py-1.5 text-sm" value={bridgeFilter} onChange={e=>setBridgeFilter(e.target.value)}>
+            <option value="">全部桥梁</option>
+            {bridges.map(b => <option key={b.id} value={b.id}>{b.bridge_name}</option>)}
+          </select>
+          <span className="text-xs text-gray-500 ml-auto">共 {filtered.length} 台</span>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-0">
+          {/* 设备列表 */}
+          <div className="border-r max-h-[640px] overflow-auto scrollbar-thin">
+            {filtered.map(d => {
+              const bridge = bridges.find(b=>b.id===d.bridge_id);
+              const usedYears = ((Date.now() - new Date(d.in_use_date)) / (365.25 * 86400000)).toFixed(1);
+              const lifeRatio = (Number(usedYears) / d.design_life_years * 100).toFixed(0);
+              return (
+                <div key={d.id}
+                  className={`p-3 border-b cursor-pointer hover:bg-blue-50 transition-all ${selected?.id===d.id?'bg-blue-50 border-l-4 border-l-blue-500':''}`}
+                  onClick={()=>setSelected(d)}>
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="font-medium text-sm truncate">{d.device_name}</div>
+                    <Tag color={d.status==='in_use'?'green':d.status==='fault'?'red':d.status==='scrapped'?'gray':'amber'}>{DEVICE_STATUS[d.status]?.label||d.status}</Tag>
+                  </div>
+                  <div className="text-xs text-gray-500 truncate">{d.device_code}</div>
+                  <div className="text-xs text-gray-500">{bridge?.bridge_name} · {catName(d.category)}</div>
+                  <div className="mt-2 flex items-center gap-2 text-xs">
+                    <span className="text-gray-500">寿命进度</span>
+                    <div className="flex-1 h-1.5 bg-gray-200 rounded">
+                      <div className={`h-full rounded ${lifeRatio>80?'bg-red-500':lifeRatio>60?'bg-amber-500':'bg-green-500'}`} style={{width:Math.min(100,lifeRatio)+'%'}}/>
+                    </div>
+                    <span className="text-gray-700 font-medium">{lifeRatio}%</span>
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && <div className="p-8 text-center text-gray-400 text-sm">暂无数据</div>}
+          </div>
+
+          {/* 时间轴视图 */}
+          <div className="col-span-2 p-4 max-h-[640px] overflow-auto scrollbar-thin">
+            {!selected ? (
+              <div className="text-center text-gray-400 py-20">
+                <div className="text-5xl mb-3">👈</div>
+                <div>请从左侧选择一台设备查看其完整生命周期</div>
+              </div>
+            ) : (
+              <LifecycleTimeline device={selected} bridges={bridges} onRefresh={reload}/>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LifecycleTimeline({ device, bridges, onRefresh }) {
+  const [events, setEvents] = useState([]);
+  const [residual, setResidual] = useState(0);
+
+  useEffect(() => { (async () => {
+    const all = await dbApi.all('lifecycle_event');
+    const list = all.filter(e => e.device_id === device.id)
+      .sort((a,b) => (a.event_date+a.create_time).localeCompare(b.event_date+b.create_time));
+    setEvents(list);
+    setResidual(await services.calcResidual(device));
+  })(); }, [device]);
+
+  const bridge = bridges.find(b => b.id === device.bridge_id);
+  const usedYears = ((Date.now() - new Date(device.in_use_date)) / (365.25 * 86400000)).toFixed(2);
+  const lifeRatio = (Number(usedYears) / device.design_life_years * 100).toFixed(1);
+
+  // 累计成本统计
+  const totalMaintain = events.filter(e => e.event_type === 'maintain').reduce((s,e)=>s+(e.cost||0), 0);
+  const totalRepair = events.filter(e => e.event_type === 'repair').reduce((s,e)=>s+(e.cost||0), 0);
+  const totalCost = device.purchase_cost + totalMaintain + totalRepair;
+
+  const eventColors = {
+    purchase:   { color:'bg-purple-500', icon:'📦', label:'采购入库' },
+    commission: { color:'bg-blue-500',   icon:'🚀', label:'投入使用' },
+    maintain:   { color:'bg-green-500',  icon:'🔧', label:'例行保养' },
+    repair:     { color:'bg-amber-500',  icon:'🛠️', label:'故障维修' },
+    scrap:      { color:'bg-red-500',    icon:'🗑️', label:'报废处置' },
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* 设备概览 */}
+      <div className="bg-gradient-to-br from-slate-50 to-blue-50 border rounded-lg p-4">
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <div className="text-lg font-bold text-gray-800">{device.device_name}</div>
+            <div className="text-xs text-gray-500">{device.device_code} · {bridge?.bridge_name} · {catName(device.category)}</div>
+          </div>
+          <Tag color={device.status==='in_use'?'green':device.status==='fault'?'red':device.status==='scrapped'?'gray':'amber'}>
+            {DEVICE_STATUS[device.status]?.label||device.status}
+          </Tag>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          <div><div className="text-xs text-gray-500">投用日期</div><div className="font-medium">{device.in_use_date}</div></div>
+          <div><div className="text-xs text-gray-500">已使用</div><div className="font-medium">{usedYears} 年</div></div>
+          <div><div className="text-xs text-gray-500">设计寿命</div><div className="font-medium">{device.design_life_years} 年</div></div>
+          <div><div className="text-xs text-gray-500">寿命进度</div>
+            <div className={`font-medium ${Number(lifeRatio)>80?'text-red-600':Number(lifeRatio)>60?'text-amber-600':'text-green-600'}`}>{lifeRatio}%</div>
+          </div>
+          <div><div className="text-xs text-gray-500">采购价</div><div className="font-medium">{fmtMoney(device.purchase_cost)}</div></div>
+          <div><div className="text-xs text-gray-500">累计保养</div><div className="font-medium text-green-600">{fmtMoney(totalMaintain)}</div></div>
+          <div><div className="text-xs text-gray-500">累计维修</div><div className="font-medium text-amber-600">{fmtMoney(totalRepair)}</div></div>
+          <div><div className="text-xs text-gray-500">当前残值</div><div className="font-medium text-purple-600">{fmtMoney(residual)}</div></div>
+        </div>
+        <div className="mt-3 text-xs text-gray-600 bg-white border rounded px-3 py-2">
+          📊 <b>全生命周期总成本（TCO）</b>：{fmtMoney(totalCost)}
+          （采购 {fmtMoney(device.purchase_cost)} + 保养 {fmtMoney(totalMaintain)} + 维修 {fmtMoney(totalRepair)}）
+        </div>
+      </div>
+
+      {/* 事件时间轴 */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h4 className="font-semibold text-gray-800">📜 生命周期事件流水</h4>
+          <span className="text-xs text-gray-500">共 {events.length} 个事件</span>
+        </div>
+        <div className="relative pl-6 border-l-2 border-gray-200 space-y-3">
+          {events.length === 0 && <div className="text-center text-gray-400 text-sm py-4">暂无事件</div>}
+          {events.map((e, idx) => {
+            const cfg = eventColors[e.event_type] || { color:'bg-gray-400', icon:'•', label:e.event_type };
+            return (
+              <div key={e.id} className="relative">
+                <div className={`absolute -left-[33px] w-6 h-6 rounded-full flex items-center justify-center ${cfg.color} text-white text-xs shadow`}>
+                  {cfg.icon}
+                </div>
+                <div className="bg-white border rounded-lg p-3 hover:shadow-sm transition-all">
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium text-sm">{e.title}</div>
+                    <div className="text-xs text-gray-500">{e.event_date}</div>
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1">{e.detail}</div>
+                  <div className="text-[10px] text-gray-400 mt-1">操作人：{e.operator} {e.cost > 0 && '· 费用：'+fmtMoney(e.cost)}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ==================== 桥梁基础参数管理 ====================
+function BridgesPage() {
+  const { user } = useApp();
+  const [bridges, setBridges] = useState([]);
+  const [keyword, setKeyword] = useState('');
+  const [edit, setEdit] = useState(null);   // 编辑抽屉
+  const [aadtModal, setAadtModal] = useState(null); // AADT 快速更新
+  const [historyModal, setHistoryModal] = useState(null);
+
+  const reload = useCallback(async () => {
+    setBridges(await dbApi.all('bridge'));
+  }, []);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const filtered = bridges.filter(b => !b.is_deleted)
+    .filter(b => !keyword || b.bridge_name.includes(keyword) || b.bridge_code.includes(keyword) || b.city.includes(keyword) || b.province.includes(keyword));
+
+  return (
+    <div className="p-6 fade-in">
+      <div className="bg-white rounded-xl shadow-sm">
+        <div className="p-4 border-b flex flex-wrap gap-2 items-center">
+          <input className="border rounded px-3 py-1.5 text-sm w-64" placeholder="搜索桥梁名/编码/省市"
+            value={keyword} onChange={e=>setKeyword(e.target.value)}/>
+          <Btn onClick={reload}>🔄 刷新</Btn>
+          <span className="text-xs text-gray-400 ml-2">共 {filtered.length} 座桥梁</span>
+          <div className="ml-auto">
+            {user.role_code === 'admin' && (
+              <Btn type="primary" onClick={()=>setEdit({ _new: true })}>+ 新建桥梁</Btn>
+            )}
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="px-3 py-2 text-left">编码</th>
+              <th className="px-3 py-2 text-left">桥梁名称</th>
+              <th className="px-3 py-2 text-left">省市</th>
+              <th className="px-3 py-2 text-left">气候带 α</th>
+              <th className="px-3 py-2 text-right">AADT</th>
+              <th className="px-3 py-2 text-center">β</th>
+              <th className="px-3 py-2 text-left">最近更新</th>
+              <th className="px-3 py-2 text-center">外部 SHM</th>
+              <th className="px-3 py-2 text-center">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(b => {
+              const stale = b.aadt_last_update && daysBetween(b.aadt_last_update, today()) > 365;
+              return (
+                <tr key={b.id} className="border-t hover:bg-gray-50">
+                  <td className="px-3 py-2 font-mono text-xs">{b.bridge_code}</td>
+                  <td className="px-3 py-2 font-medium">{b.bridge_name}</td>
+                  <td className="px-3 py-2">{b.province} · {b.city}</td>
+                  <td className="px-3 py-2"><Tag color="blue">{climateLabel(b.climate_zone)} (α={climateAlpha(b.climate_zone).toFixed(2)})</Tag></td>
+                  <td className="px-3 py-2 text-right font-medium">{b.aadt.toLocaleString()}</td>
+                  <td className="px-3 py-2 text-center"><Tag color="purple">{aadtBeta(b.aadt).toFixed(2)}</Tag></td>
+                  <td className="px-3 py-2 text-xs">
+                    {stale && <span className="text-red-600 mr-1">⚠</span>}
+                    {b.aadt_last_update}
+                    {stale && <div className="text-[10px] text-red-500">超过一年未更新</div>}
+                  </td>
+                  <td className="px-3 py-2 text-center">{b.external_monitoring_id ? <Tag color="green">已对接</Tag> : <Tag color="gray">未对接</Tag>}</td>
+                  <td className="px-3 py-2 text-center space-x-1 whitespace-nowrap">
+                    <Btn size="sm" onClick={()=>setHistoryModal(b)}>历史</Btn>
+                    {user.role_code === 'admin' && <>
+                      <Btn size="sm" onClick={()=>setAadtModal(b)}>更新 AADT</Btn>
+                      <Btn size="sm" type="text" onClick={()=>setEdit(b)}>编辑</Btn>
+                    </>}
+                  </td>
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && <tr><td colSpan="9" className="text-center text-gray-400 py-8">暂无数据</td></tr>}
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      {edit && <BridgeEditDrawer bridge={edit} onClose={()=>setEdit(null)} onSaved={()=>{setEdit(null);reload();}}/>}
+      {aadtModal && <AadtModal bridge={aadtModal} onClose={()=>setAadtModal(null)} onSaved={()=>{setAadtModal(null);reload();}}/>}
+      {historyModal && <AadtHistoryModal bridge={historyModal} onClose={()=>setHistoryModal(null)}/>}
+    </div>
+  );
+}
+
+function BridgeEditDrawer({ bridge, onClose, onSaved }) {
+  const { user } = useApp();
+  const isNew = bridge._new;
+  const [tab, setTab] = useState('basic');
+  const [form, setForm] = useState(isNew ? {
+    bridge_code:'', bridge_name:'', province:'江西', city:'', climate_zone:'temperate_normal',
+    aadt:5000, aadt_source:'人工统计', open_to_traffic_date: today(), design_load_grade:'公路-Ⅰ级',
+    responsible_dept:'', purchase_price:0, design_life_years:50, annual_maintain_cost:0,
+    target_life_years:60, external_monitoring_id:''
+  } : {...bridge});
+
+  const set = (k, v) => setForm(p => ({...p, [k]: v}));
+
+  const save = async () => {
+    if (!form.bridge_name || !form.city || !form.province) {
+      Toast.error('请填写完整的基础信息'); return;
+    }
+    if (isNew) {
+      const max = (await dbApi.all('bridge')).length + 1;
+      form.bridge_code = form.bridge_code || `BR-AUTO-${String(max).padStart(3,'0')}`;
+      form.id = uid();
+      form.aadt_last_update = today();
+      form.is_deleted = 0;
+      form.create_time = now();
+      form.update_time = now();
+      await dbApi.insert('bridge', form);
+      await services.log(user.username, 'CREATE_BRIDGE', form.bridge_code, '新建桥梁档案');
+      Toast.success('新建桥梁成功');
+    } else {
+      form.update_time = now();
+      await dbApi.update('bridge', form);
+      await services.log(user.username, 'UPDATE_BRIDGE', form.bridge_code, '修改桥梁档案');
+      Toast.success('保存成功');
+    }
+    onSaved();
+  };
+
+  return (
+    <Drawer open title={isNew ? '+ 新建桥梁' : '编辑桥梁档案'} onClose={onClose} width="640px">
+      <div className="p-5 space-y-4">
+        <div className="flex border-b">
+          {[{k:'basic',n:'基础信息'},{k:'runtime',n:'运行参数'}].map(t => (
+            <button key={t.k} onClick={()=>setTab(t.k)}
+              className={`px-4 py-2 text-sm border-b-2 -mb-px ${tab===t.k?'border-blue-500 text-blue-600':'border-transparent text-gray-500'}`}>{t.n}</button>
+          ))}
+        </div>
+
+        {tab === 'basic' && (
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="桥梁编码" value={form.bridge_code} onChange={v=>set('bridge_code',v)} disabled={!isNew} placeholder="自动生成或手动输入"/>
+            <Field label="桥梁名称*" value={form.bridge_name} onChange={v=>set('bridge_name',v)}/>
+            <Field label="所在省份" value={form.province} onChange={v=>set('province',v)}/>
+            <Field label="所在城市" value={form.city} onChange={v=>set('city',v)}/>
+            <Field type="date" label="通车日期" value={form.open_to_traffic_date} onChange={v=>set('open_to_traffic_date',v)}/>
+            <SelectField label="设计荷载等级" value={form.design_load_grade} onChange={v=>set('design_load_grade',v)}
+              options={[{v:'公路-Ⅰ级',l:'公路-Ⅰ级'},{v:'公路-Ⅱ级',l:'公路-Ⅱ级'}]}/>
+            <Field label="责任单位" value={form.responsible_dept} onChange={v=>set('responsible_dept',v)} colSpan={2}/>
+            <SelectField label="气候带（α 系数）" value={form.climate_zone} onChange={v=>set('climate_zone',v)} colSpan={2}
+              options={Object.entries(CLIMATE_ZONES).map(([k,v])=>({v:k,l:`${v.label}（α=${v.alpha}）`}))}/>
+            <Field type="number" label="设计寿命（年）" value={form.design_life_years} onChange={v=>set('design_life_years',Number(v))}/>
+            <Field type="number" label="目标延寿（年）" value={form.target_life_years} onChange={v=>set('target_life_years',Number(v))}/>
+            <Field type="number" label="桥梁采购价" value={form.purchase_price} onChange={v=>set('purchase_price',Number(v))}/>
+            <Field type="number" label="年保养费" value={form.annual_maintain_cost} onChange={v=>set('annual_maintain_cost',Number(v))}/>
+          </div>
+        )}
+
+        {tab === 'runtime' && (
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2 bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-800">
+              💡 <b>AADT 与 β 系数</b>：AADT 数值通过阶梯映射决定 β 系数，影响设备保养周期。
+              当前 β = <b>{aadtBeta(form.aadt).toFixed(2)}</b>。AADT 越大，β 越小，设备保养周期越短。
+            </div>
+            <Field type="number" label="年均日交通量 AADT*" value={form.aadt} onChange={v=>set('aadt',Number(v))}/>
+            <Field label="数据来源" value={form.aadt_source} onChange={v=>set('aadt_source',v)} placeholder="人工统计/SHM 推送"/>
+            <Field label="外部 SHM 系统 ID" value={form.external_monitoring_id} onChange={v=>set('external_monitoring_id',v)} colSpan={2} placeholder="留空表示未对接"/>
+          </div>
+        )}
+      </div>
+      <div className="p-4 border-t bg-gray-50 flex justify-end gap-2 sticky bottom-0">
+        <Btn onClick={onClose}>取消</Btn>
+        <Btn type="primary" onClick={save}>保存</Btn>
+      </div>
+    </Drawer>
+  );
+}
+
+function Field({ label, value, onChange, type='text', colSpan=1, disabled=false, placeholder }) {
+  return (
+    <div className={colSpan===2?'col-span-2':''}>
+      <label className="text-xs text-gray-600 mb-1 block">{label}</label>
+      <input type={type} value={value??''} disabled={disabled} placeholder={placeholder}
+        onChange={e=>onChange(type==='number'?e.target.value:e.target.value)}
+        className="w-full border rounded px-2.5 py-1.5 text-sm focus:border-blue-500 disabled:bg-gray-100"/>
+    </div>
+  );
+}
+function SelectField({ label, value, onChange, options, colSpan=1 }) {
+  return (
+    <div className={colSpan===2?'col-span-2':''}>
+      <label className="text-xs text-gray-600 mb-1 block">{label}</label>
+      <select value={value} onChange={e=>onChange(e.target.value)}
+        className="w-full border rounded px-2.5 py-1.5 text-sm focus:border-blue-500">
+        {options.map(o => <option key={o.v} value={o.v}>{o.l}</option>)}
+      </select>
+    </div>
+  );
+}
+function TextareaField({ label, value, onChange, colSpan=1 }) {
+  return (
+    <div className={colSpan===2?'col-span-2':''}>
+      <label className="text-xs text-gray-600 mb-1 block">{label}</label>
+      <textarea value={value??''} onChange={e=>onChange(e.target.value)} rows={3}
+        className="w-full border rounded px-2.5 py-1.5 text-sm focus:border-blue-500"/>
+    </div>
+  );
+}
+
+function AadtModal({ bridge, onClose, onSaved }) {
+  const { user } = useApp();
+  const [aadt, setAadt] = useState(bridge.aadt);
+  const [source, setSource] = useState('人工统计');
+
+  const save = async () => {
+    if (Number(aadt) <= 0) { Toast.error('AADT 必须为正整数'); return; }
+    if (!source.trim()) { Toast.error('请填写数据来源'); return; }
+    bridge.aadt = Number(aadt);
+    bridge.aadt_source = source;
+    bridge.aadt_last_update = today();
+    bridge.update_time = now();
+    await dbApi.update('bridge', bridge);
+    await dbApi.insert('bridge_aadt_history', {
+      id:uid(), bridge_id:bridge.id, aadt:Number(aadt), source, operator:user.username, changed_at: now()
+    });
+    await services.log(user.username, 'UPDATE_AADT', bridge.bridge_code, `AADT 更新为 ${aadt}（${source}）`);
+    Toast.success('AADT 已更新，并已同步至历史记录');
+    onSaved();
+  };
+
+  return (
+    <Modal open title={`快速更新 AADT - ${bridge.bridge_name}`} onClose={onClose} width="460px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="primary" onClick={save}>提交</Btn></>}>
+      <div className="space-y-3">
+        <div className="bg-gray-50 border rounded p-3 text-sm">
+          <div className="text-xs text-gray-500">当前 AADT</div>
+          <div className="font-bold text-lg">{bridge.aadt.toLocaleString()}（β = {aadtBeta(bridge.aadt).toFixed(2)}）</div>
+          <div className="text-xs text-gray-400 mt-1">最近更新：{bridge.aadt_last_update}</div>
+        </div>
+        <Field type="number" label="新 AADT 值" value={aadt} onChange={setAadt}/>
+        <Field label="来源说明" value={source} onChange={setSource} placeholder="如：年度统计 / SHM 推送"/>
+        <div className="bg-blue-50 border border-blue-200 rounded p-2 text-xs text-blue-800">
+          更新后新的 β 系数：<b>{aadtBeta(Number(aadt)).toFixed(2)}</b>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AadtHistoryModal({ bridge, onClose }) {
+  const [list, setList] = useState([]);
+  useEffect(() => { (async () => {
+    const all = await dbApi.all('bridge_aadt_history');
+    setList(all.filter(h => h.bridge_id === bridge.id).sort((a,b)=>b.changed_at.localeCompare(a.changed_at)));
+  })(); }, [bridge]);
+
+  const option = {
+    tooltip:{trigger:'axis'},
+    grid:{left:50,right:20,top:30,bottom:25},
+    xAxis:{type:'category',data:list.slice().reverse().map(h=>h.changed_at.slice(0,10)),axisLabel:{fontSize:10}},
+    yAxis:{type:'value',axisLabel:{formatter:'{value}',fontSize:10}},
+    series:[{ type:'line', smooth:true, data:list.slice().reverse().map(h=>h.aadt), itemStyle:{color:'#3b82f6'}, areaStyle:{opacity:0.3} }]
+  };
+
+  return (
+    <Modal open title={`AADT 历史 - ${bridge.bridge_name}`} onClose={onClose} width="640px"
+      footer={<Btn onClick={onClose}>关闭</Btn>}>
+      <Chart option={option} height="220px"/>
+      <div className="mt-3 max-h-72 overflow-auto scrollbar-thin">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-xs"><tr><th className="px-3 py-2 text-left">变更时间</th><th className="px-3 py-2 text-right">AADT</th><th className="px-3 py-2 text-left">来源</th><th className="px-3 py-2 text-left">操作人</th></tr></thead>
+          <tbody>
+            {list.map(h => (
+              <tr key={h.id} className="border-t"><td className="px-3 py-1.5 text-xs">{h.changed_at}</td><td className="px-3 py-1.5 text-right">{h.aadt.toLocaleString()}</td><td className="px-3 py-1.5">{h.source}</td><td className="px-3 py-1.5">{h.operator}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
+  );
+}
+
+
+// ==================== 设备档案管理 ====================
+function DevicesPage() {
+  const { user } = useApp();
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [keyword, setKeyword] = useState('');
+  const [bridgeFilter, setBridgeFilter] = useState('');
+  const [catFilter, setCatFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [edit, setEdit] = useState(null);
+  const [detail, setDetail] = useState(null);
+
+  const reload = useCallback(async () => {
+    setDevices(await dbApi.all('device_archive'));
+    setBridges(await dbApi.all('bridge'));
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const filtered = useMemo(() => devices.filter(d => !d.is_deleted)
+    .filter(d => !keyword || d.device_name.includes(keyword) || d.device_code.includes(keyword))
+    .filter(d => !bridgeFilter || d.bridge_id === bridgeFilter)
+    .filter(d => !catFilter || d.category === catFilter)
+    .filter(d => !statusFilter || d.status === statusFilter),
+    [devices, keyword, bridgeFilter, catFilter, statusFilter]);
+
+  return (
+    <div className="p-6 fade-in">
+      <div className="bg-white rounded-xl shadow-sm">
+        <div className="p-4 border-b flex flex-wrap gap-2 items-center">
+          <input className="border rounded px-3 py-1.5 text-sm w-48" placeholder="设备名称/编码" value={keyword} onChange={e=>setKeyword(e.target.value)}/>
+          <select className="border rounded px-3 py-1.5 text-sm" value={bridgeFilter} onChange={e=>setBridgeFilter(e.target.value)}>
+            <option value="">全部桥梁</option>
+            {bridges.map(b => <option key={b.id} value={b.id}>{b.bridge_name}</option>)}
+          </select>
+          <select className="border rounded px-3 py-1.5 text-sm" value={catFilter} onChange={e=>setCatFilter(e.target.value)}>
+            <option value="">全部分类</option>
+            {DEVICE_CATEGORIES.map(c => <option key={c.code} value={c.code}>{c.name}</option>)}
+          </select>
+          <select className="border rounded px-3 py-1.5 text-sm" value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}>
+            <option value="">全部状态</option>
+            {Object.entries(DEVICE_STATUS).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+          <span className="text-xs text-gray-500 ml-2">共 {filtered.length} 台</span>
+          <div className="ml-auto flex gap-2">
+            {(user.role_code === 'admin' || user.role_code === 'engineer') && (
+              <Btn type="primary" onClick={()=>setEdit({_new:true})}>+ 新增设备</Btn>
+            )}
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="px-3 py-2 text-left">设备编码</th>
+              <th className="px-3 py-2 text-left">设备名称</th>
+              <th className="px-3 py-2 text-left">分类</th>
+              <th className="px-3 py-2 text-left">所属桥梁</th>
+              <th className="px-3 py-2 text-center">状态</th>
+              <th className="px-3 py-2 text-right">采购价</th>
+              <th className="px-3 py-2 text-left">下次保养</th>
+              <th className="px-3 py-2 text-center">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(d => {
+              const overdue = d.next_maintain_date && d.next_maintain_date < today() && d.status === 'in_use';
+              const upcoming = d.next_maintain_date && daysBetween(today(), d.next_maintain_date) <= 7 && daysBetween(today(), d.next_maintain_date) >= 0;
+              return (
+                <tr key={d.id} className={`border-t hover:bg-gray-50 ${overdue?'bg-red-50/40':upcoming?'bg-yellow-50/40':''}`}>
+                  <td className="px-3 py-2 font-mono text-xs">{d.device_code}</td>
+                  <td className="px-3 py-2 font-medium">{d.device_name}</td>
+                  <td className="px-3 py-2">{catName(d.category)}</td>
+                  <td className="px-3 py-2 text-xs">{bridges.find(b=>b.id===d.bridge_id)?.bridge_name||'-'}</td>
+                  <td className="px-3 py-2 text-center">
+                    <Tag color={d.status==='in_use'?'green':d.status==='fault'?'red':d.status==='scrapped'?'gray':d.status==='maintaining'?'amber':'blue'}>{DEVICE_STATUS[d.status]?.label}</Tag>
+                  </td>
+                  <td className="px-3 py-2 text-right text-xs">{fmtMoney(d.purchase_cost)}</td>
+                  <td className="px-3 py-2 text-xs">
+                    {overdue && <span className="text-red-600">⚠ </span>}
+                    {upcoming && <span className="text-amber-600">⏰ </span>}
+                    {d.next_maintain_date}
+                  </td>
+                  <td className="px-3 py-2 text-center space-x-1 whitespace-nowrap">
+                    <Btn size="sm" onClick={()=>setDetail(d)}>详情</Btn>
+                    {(user.role_code === 'admin' || user.role_code === 'engineer') && (
+                      <Btn size="sm" type="text" onClick={()=>setEdit(d)}>变更</Btn>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && <tr><td colSpan="8" className="text-center text-gray-400 py-8">暂无数据</td></tr>}
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      {edit && <DeviceEditDrawer device={edit} bridges={bridges} onClose={()=>setEdit(null)} onSaved={()=>{setEdit(null);reload();}}/>}
+      {detail && <DeviceDetailModal device={detail} bridges={bridges} onClose={()=>setDetail(null)}/>}
+    </div>
+  );
+}
+
+function DeviceEditDrawer({ device, bridges, onClose, onSaved }) {
+  const { user } = useApp();
+  const isNew = device._new;
+  const [form, setForm] = useState(isNew ? {
+    bridge_id: bridges[0]?.id || '', category:'lighting', device_name:'', spec:'', manufacturer:'',
+    purchase_cost: 0, annual_maintain_cost: 0, annual_repair_cost: 0,
+    in_use_date: today(), status:'in_use', design_life_years: 8,
+    last_maintain_date: today(), next_maintain_date: addDays(today(), 90),
+    fault_count_month: 0, fault_count_year: 0, external_monitoring: 0,
+  } : {...device});
+  const set = (k,v) => setForm(p => ({...p, [k]: v}));
+
+  const save = async () => {
+    if (!form.device_name || !form.bridge_id || !form.category) {
+      Toast.error('请完整填写关键字段'); return;
+    }
+    if (isNew) {
+      // 自动生成编码
+      const bridge = bridges.find(b => b.id === form.bridge_id);
+      const cat = catCfg(form.category);
+      const year = form.in_use_date.slice(0, 4);
+      const all = await dbApi.all('device_archive');
+      const sameSeries = all.filter(d => d.bridge_id===form.bridge_id && d.category===form.category && d.in_use_date.startsWith(year));
+      const seq = String(sameSeries.length + 1).padStart(3,'0');
+      form.device_code = `${bridge.bridge_code}-${cat.abbr}-${year}-${seq}`;
+      form.id = uid();
+      form.design_life_years = form.design_life_years || cat.designLife;
+      form.is_deleted = 0;
+      form.create_time = now();
+      form.update_time = now();
+      await dbApi.insert('device_archive', form);
+      // 同步生命周期事件
+      await services.logLifecycle(form.id, 'purchase', '设备采购入库', `${form.device_name} 采购入库，单价 ${fmtMoney(form.purchase_cost)}`, user.username, form.purchase_cost);
+      await services.logLifecycle(form.id, 'commission', '设备投入使用', `${form.device_name} 安装并投入使用，预计设计寿命 ${form.design_life_years} 年`, user.username, 0);
+      await services.log(user.username, 'CREATE_DEVICE', form.device_code, '新增设备档案');
+      Toast.success(`新增成功，编码：${form.device_code}`);
+    } else {
+      form.update_time = now();
+      await dbApi.update('device_archive', form);
+      await services.log(user.username, 'UPDATE_DEVICE', form.device_code, '修改设备档案');
+      Toast.success('保存成功');
+    }
+    onSaved();
+  };
+
+  return (
+    <Drawer open title={isNew?'+ 新增设备':'编辑设备档案'} onClose={onClose} width="620px">
+      <div className="p-5 space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <SelectField label="所属桥梁*" value={form.bridge_id} onChange={v=>set('bridge_id',v)}
+            options={bridges.map(b=>({v:b.id,l:b.bridge_name}))}/>
+          <SelectField label="设备分类*" value={form.category} onChange={v=>{
+              const c = catCfg(v);
+              set('category', v);
+              if (isNew) set('design_life_years', c.designLife);
+            }}
+            options={DEVICE_CATEGORIES.map(c=>({v:c.code,l:c.name}))}/>
+          <Field label="设备名称*" value={form.device_name} onChange={v=>set('device_name',v)} colSpan={2}/>
+          <Field label="规格型号" value={form.spec} onChange={v=>set('spec',v)}/>
+          <Field label="生产厂家" value={form.manufacturer} onChange={v=>set('manufacturer',v)}/>
+          <Field type="date" label="投用日期*" value={form.in_use_date} onChange={v=>set('in_use_date',v)}/>
+          <Field type="number" label="设计寿命（年）" value={form.design_life_years} onChange={v=>set('design_life_years',Number(v))}/>
+          <Field type="number" label="采购成本*" value={form.purchase_cost} onChange={v=>set('purchase_cost',Number(v))}/>
+          <SelectField label="设备状态" value={form.status} onChange={v=>set('status',v)}
+            options={Object.entries(DEVICE_STATUS).map(([k,v])=>({v:k,l:v.label}))}/>
+          <Field type="number" label="年保养费" value={form.annual_maintain_cost} onChange={v=>set('annual_maintain_cost',Number(v))}/>
+          <Field type="number" label="年维修费" value={form.annual_repair_cost} onChange={v=>set('annual_repair_cost',Number(v))}/>
+          <Field type="date" label="上次保养" value={form.last_maintain_date} onChange={v=>set('last_maintain_date',v)}/>
+          <Field type="date" label="下次保养" value={form.next_maintain_date} onChange={v=>set('next_maintain_date',v)}/>
+        </div>
+        {!isNew && (
+          <div className="bg-gray-50 border rounded p-3 text-xs text-gray-600">
+            <b>当前编码：</b>{form.device_code} · <b>创建时间：</b>{form.create_time}
+          </div>
+        )}
+      </div>
+      <div className="p-4 border-t bg-gray-50 flex justify-end gap-2 sticky bottom-0">
+        <Btn onClick={onClose}>取消</Btn>
+        <Btn type="primary" onClick={save}>保存</Btn>
+      </div>
+    </Drawer>
+  );
+}
+
+function DeviceDetailModal({ device, bridges, onClose }) {
+  const [residual, setResidual] = useState(0);
+  const [maintainCount, setMaintainCount] = useState(0);
+  const [faultCount, setFaultCount] = useState(0);
+  useEffect(()=>{(async()=>{
+    setResidual(await services.calcResidual(device));
+    const ms = await dbApi.query('maintain_record', m => m.device_id === device.id);
+    setMaintainCount(ms.length);
+    const fs = await dbApi.query('fault_order', f => f.device_id === device.id);
+    setFaultCount(fs.length);
+  })();}, [device]);
+  const bridge = bridges.find(b=>b.id===device.bridge_id);
+  const usedYears = ((Date.now() - new Date(device.in_use_date)) / (365.25*86400000)).toFixed(2);
+  const lifeRatio = (Number(usedYears)/device.design_life_years*100).toFixed(1);
+
+  return (
+    <Modal open title="设备详情" onClose={onClose} width="600px" footer={<Btn onClick={onClose}>关闭</Btn>}>
+      <div className="space-y-3 text-sm">
+        <div className="bg-gradient-to-br from-slate-50 to-blue-50 rounded p-3">
+          <div className="text-lg font-bold">{device.device_name}</div>
+          <div className="text-xs text-gray-500 font-mono">{device.device_code}</div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          {[
+            ['所属桥梁', bridge?.bridge_name],
+            ['设备分类', catName(device.category)],
+            ['当前状态', DEVICE_STATUS[device.status]?.label],
+            ['投用日期', device.in_use_date],
+            ['已使用年数', usedYears + ' 年 ('+lifeRatio+'%)'],
+            ['设计寿命', device.design_life_years + ' 年'],
+            ['规格型号', device.spec || '-'],
+            ['生产厂家', device.manufacturer || '-'],
+            ['采购成本', fmtMoney(device.purchase_cost)],
+            ['当前残值', fmtMoney(residual)],
+            ['年保养费', fmtMoney(device.annual_maintain_cost)],
+            ['年维修费', fmtMoney(device.annual_repair_cost)],
+            ['上次保养', device.last_maintain_date || '-'],
+            ['下次保养', device.next_maintain_date || '-'],
+            ['累计保养次数', maintainCount + ' 次'],
+            ['累计故障次数', faultCount + ' 次'],
+            ['本月故障', device.fault_count_month + ' 次'],
+            ['外部监测', device.external_monitoring ? '已对接' : '未对接'],
+          ].map(([k,v]) => (
+            <div key={k} className="flex border-b py-1.5">
+              <span className="text-gray-500 w-24">{k}</span>
+              <span className="font-medium flex-1">{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+
+// ==================== 保养计划 / 保养记录上报 ====================
+function MaintainPage() {
+  const { user } = useApp();
+  const [tab, setTab] = useState('plan');
+  return (
+    <div className="p-6 fade-in">
+      <div className="bg-white rounded-xl shadow-sm">
+        <div className="border-b flex">
+          {[{k:'plan',n:'保养计划'},{k:'record',n:'保养记录'}].map(t => (
+            <button key={t.k} onClick={()=>setTab(t.k)}
+              className={`px-5 py-3 text-sm border-b-2 -mb-px ${tab===t.k?'border-blue-500 text-blue-600':'border-transparent text-gray-500 hover:text-gray-700'}`}>{t.n}</button>
+          ))}
+        </div>
+        {tab === 'plan' && <MaintainPlanList/>}
+        {tab === 'record' && <MaintainRecordList/>}
+      </div>
+    </div>
+  );
+}
+
+function MaintainPlanList() {
+  const { user } = useApp();
+  const [plans, setPlans] = useState([]);
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [reportDevice, setReportDevice] = useState(null);
+
+  const reload = useCallback(async () => {
+    setPlans(await dbApi.all('maintain_plan'));
+    setDevices(await dbApi.all('device_archive'));
+    setBridges(await dbApi.all('bridge'));
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const enriched = plans.map(p => {
+    const d = devices.find(x => x.id === p.device_id);
+    const b = bridges.find(x => x.id === d?.bridge_id);
+    const overdue = d && d.next_maintain_date && d.next_maintain_date < today();
+    const upcoming = d && d.next_maintain_date && daysBetween(today(), d.next_maintain_date) <= 7;
+    return { ...p, device: d, bridge: b, overdue, upcoming };
+  }).filter(p => p.device).sort((a,b) => (a.device.next_maintain_date||'').localeCompare(b.device.next_maintain_date||''));
+
+  return (
+    <>
+      <div className="p-3 border-b flex items-center gap-3 text-xs">
+        <Tag color="red">超期 {enriched.filter(p=>p.overdue).length}</Tag>
+        <Tag color="amber">7 天内到期 {enriched.filter(p=>p.upcoming&&!p.overdue).length}</Tag>
+        <Tag color="green">正常 {enriched.filter(p=>!p.overdue&&!p.upcoming).length}</Tag>
+      </div>
+      <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 text-xs text-gray-600">
+          <tr>
+            <th className="px-3 py-2 text-left">设备</th>
+            <th className="px-3 py-2 text-left">所属桥梁</th>
+            <th className="px-3 py-2 text-left">分类</th>
+            <th className="px-3 py-2 text-center">保养周期</th>
+            <th className="px-3 py-2 text-left">上次保养</th>
+            <th className="px-3 py-2 text-left">下次保养</th>
+            <th className="px-3 py-2 text-center">状态</th>
+            <th className="px-3 py-2 text-center">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {enriched.map(p => (
+            <tr key={p.id} className={`border-t hover:bg-gray-50 ${p.overdue?'bg-red-50/30':p.upcoming?'bg-yellow-50/30':''}`}>
+              <td className="px-3 py-2"><div className="font-medium">{p.device.device_name}</div><div className="text-xs text-gray-500 font-mono">{p.device.device_code}</div></td>
+              <td className="px-3 py-2 text-xs">{p.bridge?.bridge_name}</td>
+              <td className="px-3 py-2 text-xs">{catName(p.device.category)}</td>
+              <td className="px-3 py-2 text-center text-xs">{p.cycle_days} 天</td>
+              <td className="px-3 py-2 text-xs">{p.device.last_maintain_date}</td>
+              <td className="px-3 py-2 text-xs">
+                {p.overdue && <span className="text-red-600 font-bold">⚠ </span>}
+                {p.upcoming && !p.overdue && <span className="text-amber-600">⏰ </span>}
+                {p.device.next_maintain_date}
+                {p.overdue && <div className="text-[10px] text-red-500">超期 {daysBetween(p.device.next_maintain_date, today())} 天</div>}
+              </td>
+              <td className="px-3 py-2 text-center">
+                {p.overdue ? <Tag color="red">超期</Tag> : p.upcoming ? <Tag color="amber">即将到期</Tag> : <Tag color="green">正常</Tag>}
+              </td>
+              <td className="px-3 py-2 text-center">
+                {(user.role_code === 'maintainer' || user.role_code === 'admin' || user.role_code === 'engineer') && (
+                  <Btn type="primary" size="sm" onClick={()=>setReportDevice(p.device)}>上报保养</Btn>
+                )}
+              </td>
+            </tr>
+          ))}
+          {enriched.length === 0 && <tr><td colSpan="8" className="text-center text-gray-400 py-8">暂无计划</td></tr>}
+        </tbody>
+      </table>
+      </div>
+      {reportDevice && <ReportMaintainModal device={reportDevice} onClose={()=>setReportDevice(null)} onSaved={()=>{setReportDevice(null);reload();}}/>}
+    </>
+  );
+}
+
+function ReportMaintainModal({ device, onClose, onSaved }) {
+  const { user } = useApp();
+  const [content, setContent] = useState('例行' + catName(device.category) + '保养');
+  const [manhour, setManhour] = useState(2);
+  const [actualCost, setActualCost] = useState(Math.round((device.annual_maintain_cost || 0) / 4));
+  const [material, setMaterial] = useState('常规耗材');
+  const [result, setResult] = useState('normal');
+
+  const submit = async () => {
+    if (!content.trim()) { Toast.error('请填写保养内容'); return; }
+    if (Number(manhour) <= 0) { Toast.error('工时必须为正数'); return; }
+
+    // 写入保养记录
+    await dbApi.insert('maintain_record', {
+      id:uid(), device_id:device.id, bridge_id:device.bridge_id, category:device.category,
+      record_date:today(), actual_cost:Number(actualCost), manhour:Number(manhour),
+      material, content, operator:user.username, photos:0, result, create_time:now()
+    });
+
+    // 更新设备的上次/下次保养日期
+    const cycleDays = catCfg(device.category).maintainCycleDays;
+    const bridge = await dbApi.get('bridge', device.bridge_id);
+    const adjustedCycle = Math.round(cycleDays * climateAlpha(bridge?.climate_zone) * aadtBeta(bridge?.aadt || 10000));
+    device.last_maintain_date = today();
+    device.next_maintain_date = addDays(today(), adjustedCycle);
+    if (device.status === 'maintaining') device.status = 'in_use';
+    device.update_time = now();
+    await dbApi.update('device_archive', device);
+
+    // 写生命周期事件
+    await services.logLifecycle(device.id, 'maintain', '例行保养',
+      `${device.device_name}：${content}，工时 ${manhour}h，费用 ${fmtMoney(actualCost)}`,
+      user.username, Number(actualCost));
+
+    if (result === 'fault_found') {
+      // 一键转维修工单
+      await dbApi.insert('fault_order', {
+        id:uid(), device_id:device.id, bridge_id:device.bridge_id, category:device.category,
+        report_date:today(), report_user:user.username, fault_desc:'保养中发现潜在故障：'+content,
+        repair_cost:0, repair_user:null, status:'pending', close_date:null, downtime_hours:null,
+        create_time:now()
+      });
+      Toast.warn('已上报保养记录，并自动生成维修工单');
+    } else {
+      Toast.success('保养记录已上报');
+    }
+    await services.log(user.username, 'REPORT_MAINTAIN', device.device_code, content);
+    onSaved();
+  };
+
+  return (
+    <Modal open title={`上报保养记录 - ${device.device_name}`} onClose={onClose} width="500px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="primary" onClick={submit}>提交</Btn></>}>
+      <div className="space-y-3">
+        <div className="bg-gray-50 border rounded p-2 text-xs">
+          {device.device_code} · {catName(device.category)} · 上次保养 {device.last_maintain_date}
+        </div>
+        <TextareaField label="保养内容" value={content} onChange={setContent}/>
+        <div className="grid grid-cols-2 gap-3">
+          <Field type="number" label="工时（小时）" value={manhour} onChange={setManhour}/>
+          <Field type="number" label="实际费用" value={actualCost} onChange={setActualCost}/>
+        </div>
+        <Field label="消耗材料" value={material} onChange={setMaterial}/>
+        <SelectField label="保养结果" value={result} onChange={setResult}
+          options={[{v:'normal',l:'正常完成'},{v:'fault_found',l:'发现潜在故障 - 自动转维修工单'}]}/>
+      </div>
+    </Modal>
+  );
+}
+
+function MaintainRecordList() {
+  const [records, setRecords] = useState([]);
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [keyword, setKeyword] = useState('');
+
+  useEffect(()=>{(async()=>{
+    setRecords((await dbApi.all('maintain_record')).sort((a,b)=>b.record_date.localeCompare(a.record_date)));
+    setDevices(await dbApi.all('device_archive'));
+    setBridges(await dbApi.all('bridge'));
+  })();}, []);
+
+  const enriched = records.map(r => {
+    const d = devices.find(x => x.id === r.device_id);
+    const b = bridges.find(x => x.id === d?.bridge_id);
+    return { ...r, device: d, bridge: b };
+  }).filter(r => r.device && (!keyword || r.device.device_name.includes(keyword)));
+
+  return (
+    <>
+      <div className="p-3 border-b flex items-center gap-3">
+        <input className="border rounded px-3 py-1.5 text-sm" placeholder="搜索设备" value={keyword} onChange={e=>setKeyword(e.target.value)}/>
+        <span className="text-xs text-gray-500">共 {enriched.length} 条记录</span>
+      </div>
+      <div className="overflow-x-auto max-h-[640px]">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 text-xs sticky top-0">
+          <tr><th className="px-3 py-2 text-left">日期</th><th className="px-3 py-2 text-left">设备</th><th className="px-3 py-2 text-left">桥梁</th><th className="px-3 py-2 text-left">内容</th><th className="px-3 py-2 text-right">工时</th><th className="px-3 py-2 text-right">费用</th><th className="px-3 py-2 text-left">操作人</th></tr>
+        </thead>
+        <tbody>
+          {enriched.slice(0,200).map(r => (
+            <tr key={r.id} className="border-t hover:bg-gray-50">
+              <td className="px-3 py-1.5 text-xs">{r.record_date}</td>
+              <td className="px-3 py-1.5"><div className="font-medium text-sm">{r.device.device_name}</div><div className="text-[10px] text-gray-500 font-mono">{r.device.device_code}</div></td>
+              <td className="px-3 py-1.5 text-xs">{r.bridge?.bridge_name}</td>
+              <td className="px-3 py-1.5 text-xs">{r.content}</td>
+              <td className="px-3 py-1.5 text-right">{r.manhour}h</td>
+              <td className="px-3 py-1.5 text-right text-green-700">{fmtMoney(r.actual_cost)}</td>
+              <td className="px-3 py-1.5 text-xs">{r.operator}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      </div>
+    </>
+  );
+}
+
+
+// ==================== 故障维修工单 ====================
+function FaultPage() {
+  const { user } = useApp();
+  const [orders, setOrders] = useState([]);
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [reportOpen, setReportOpen] = useState(false);
+  const [closeOrder, setCloseOrder] = useState(null);
+
+  const reload = useCallback(async () => {
+    setOrders((await dbApi.all('fault_order')).sort((a,b)=>b.report_date.localeCompare(a.report_date)));
+    setDevices(await dbApi.all('device_archive'));
+    setBridges(await dbApi.all('bridge'));
+  }, []);
+  useEffect(()=>{ reload(); }, [reload]);
+
+  const filtered = orders.filter(o => !statusFilter || o.status === statusFilter);
+  const stats = {
+    total: orders.length,
+    pending: orders.filter(o=>o.status==='pending').length,
+    closed: orders.filter(o=>o.status==='closed').length,
+    closeRate: orders.length > 0 ? (orders.filter(o=>o.status==='closed').length / orders.length * 100).toFixed(1) : '0.0',
+  };
+
+  return (
+    <div className="p-6 fade-in">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <StatCard title="工单总数" value={stats.total} icon="📋" color="blue"/>
+        <StatCard title="待处理" value={stats.pending} icon="⏳" color="amber"/>
+        <StatCard title="已关闭" value={stats.closed} icon="✅" color="green"/>
+        <StatCard title="工单关闭率" value={stats.closeRate+'%'} icon="📈" color="purple"/>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm">
+        <div className="p-4 border-b flex flex-wrap gap-2 items-center">
+          <select className="border rounded px-3 py-1.5 text-sm" value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}>
+            <option value="">全部状态</option>
+            <option value="pending">待处理</option>
+            <option value="closed">已关闭</option>
+          </select>
+          <span className="text-xs text-gray-500">共 {filtered.length} 条</span>
+          <div className="ml-auto">
+            {(user.role_code === 'maintainer' || user.role_code === 'admin' || user.role_code === 'engineer') && (
+              <Btn type="primary" onClick={()=>setReportOpen(true)}>+ 故障申报</Btn>
+            )}
+          </div>
+        </div>
+        <div className="overflow-x-auto max-h-[560px]">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-xs sticky top-0">
+            <tr><th className="px-3 py-2 text-left">报修日期</th><th className="px-3 py-2 text-left">设备</th><th className="px-3 py-2 text-left">桥梁</th><th className="px-3 py-2 text-left">故障描述</th><th className="px-3 py-2 text-right">维修费</th><th className="px-3 py-2 text-center">停机时长</th><th className="px-3 py-2 text-center">状态</th><th className="px-3 py-2 text-center">操作</th></tr>
+          </thead>
+          <tbody>
+            {filtered.slice(0, 300).map(o => {
+              const d = devices.find(x => x.id === o.device_id);
+              const b = bridges.find(x => x.id === o.bridge_id);
+              return (
+                <tr key={o.id} className="border-t hover:bg-gray-50">
+                  <td className="px-3 py-1.5 text-xs">{o.report_date}</td>
+                  <td className="px-3 py-1.5">
+                    <div className="font-medium text-sm">{d?.device_name||'-'}</div>
+                    <div className="text-[10px] text-gray-500 font-mono">{d?.device_code}</div>
+                  </td>
+                  <td className="px-3 py-1.5 text-xs">{b?.bridge_name}</td>
+                  <td className="px-3 py-1.5 text-xs max-w-xs truncate" title={o.fault_desc}>{o.fault_desc}</td>
+                  <td className="px-3 py-1.5 text-right">{o.repair_cost ? fmtMoney(o.repair_cost) : '-'}</td>
+                  <td className="px-3 py-1.5 text-center text-xs">{o.downtime_hours ? o.downtime_hours+' h' : '-'}</td>
+                  <td className="px-3 py-1.5 text-center"><Tag color={o.status==='pending'?'amber':'green'}>{o.status==='pending'?'待处理':'已关闭'}</Tag></td>
+                  <td className="px-3 py-1.5 text-center">
+                    {o.status === 'pending' && (user.role_code !== 'purchaser' && user.role_code !== 'scrap') &&
+                      <Btn size="sm" type="primary" onClick={()=>setCloseOrder({...o, device:d})}>处理工单</Btn>}
+                    {o.status === 'closed' && <span className="text-xs text-gray-400">{o.close_date}关闭</span>}
+                  </td>
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && <tr><td colSpan="8" className="text-center text-gray-400 py-8">暂无工单</td></tr>}
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      {reportOpen && <ReportFaultModal devices={devices.filter(d=>!d.is_deleted&&d.status!=='scrapped')} onClose={()=>setReportOpen(false)} onSaved={()=>{setReportOpen(false);reload();}}/>}
+      {closeOrder && <CloseFaultModal order={closeOrder} onClose={()=>setCloseOrder(null)} onSaved={()=>{setCloseOrder(null);reload();}}/>}
+    </div>
+  );
+}
+
+function ReportFaultModal({ devices, onClose, onSaved }) {
+  const { user } = useApp();
+  const [deviceId, setDeviceId] = useState(devices[0]?.id || '');
+  const [desc, setDesc] = useState('');
+
+  const submit = async () => {
+    if (!desc.trim() || !deviceId) { Toast.error('请填写完整信息'); return; }
+    const device = devices.find(d => d.id === deviceId);
+    await dbApi.insert('fault_order', {
+      id:uid(), device_id:deviceId, bridge_id:device.bridge_id, category:device.category,
+      report_date:today(), report_user:user.username, fault_desc:desc,
+      repair_cost:0, repair_user:null, status:'pending', close_date:null, downtime_hours:null,
+      create_time:now()
+    });
+    // 设备状态变为 fault
+    if (device.status === 'in_use') {
+      device.status = 'fault';
+      device.fault_count_month = (device.fault_count_month || 0) + 1;
+      await dbApi.update('device_archive', device);
+    }
+    await services.log(user.username, 'REPORT_FAULT', device.device_code, desc);
+    Toast.success('故障已上报，等待维修');
+    onSaved();
+  };
+
+  return (
+    <Modal open title="故障申报" onClose={onClose} width="500px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="danger" onClick={submit}>提交申报</Btn></>}>
+      <div className="space-y-3">
+        <SelectField label="选择设备*" value={deviceId} onChange={setDeviceId}
+          options={devices.map(d => ({v:d.id, l:`${d.device_name} (${d.device_code})`}))}/>
+        <TextareaField label="故障描述*" value={desc} onChange={setDesc}/>
+        <div className="text-xs text-gray-500 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠ 提交后设备状态将自动变为"故障中"，本月故障次数 +1
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function CloseFaultModal({ order, onClose, onSaved }) {
+  const { user } = useApp();
+  const [cost, setCost] = useState(Math.round((order.device?.annual_repair_cost || 1000) * 0.3));
+  const [hours, setHours] = useState(8);
+
+  const submit = async () => {
+    if (Number(cost) < 0) { Toast.error('维修费不能为负数'); return; }
+    order.status = 'closed';
+    order.repair_cost = Number(cost);
+    order.repair_user = user.username;
+    order.close_date = today();
+    order.downtime_hours = Number(hours);
+    await dbApi.update('fault_order', order);
+
+    // 设备状态恢复
+    const device = await dbApi.get('device_archive', order.device_id);
+    if (device.status === 'fault') {
+      device.status = 'in_use';
+      await dbApi.update('device_archive', device);
+    }
+    await services.logLifecycle(order.device_id, 'repair', '故障修复',
+      `${device.device_name}：${order.fault_desc}；维修费用 ${fmtMoney(cost)}`,
+      user.username, Number(cost));
+    await services.log(user.username, 'CLOSE_FAULT', device.device_code, '关闭工单：'+order.fault_desc);
+    Toast.success('工单已关闭');
+    onSaved();
+  };
+
+  return (
+    <Modal open title="处理维修工单" onClose={onClose} width="500px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="success" onClick={submit}>关闭工单</Btn></>}>
+      <div className="space-y-3 text-sm">
+        <div className="bg-gray-50 border rounded p-3">
+          <div><b>设备：</b>{order.device?.device_name}</div>
+          <div className="text-xs text-gray-500 mt-1">{order.device?.device_code}</div>
+          <div className="mt-2"><b>故障：</b>{order.fault_desc}</div>
+          <div className="text-xs text-gray-500">报修日期：{order.report_date}</div>
+        </div>
+        <Field type="number" label="维修费用" value={cost} onChange={setCost}/>
+        <Field type="number" label="停机时长（小时）" value={hours} onChange={setHours}/>
+      </div>
+    </Modal>
+  );
+}
+
+
+// =============================================================================
+// PurchasePage - 采购订单管理（采购员）
+// =============================================================================
+function PurchasePage() {
+  const { user } = useApp();
+  const [orders, setOrders] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [creating, setCreating] = useState(false);
+  const [filterStatus, setFilterStatus] = useState('');
+
+  const reload = async () => {
+    const list = await dbApi.all('purchase_order');
+    list.sort((a,b) => (b.create_time||'').localeCompare(a.create_time||''));
+    setOrders(list);
+    setBridges(await dbApi.all('bridge'));
+  };
+  useEffect(() => { reload(); }, []);
+
+  const filtered = filterStatus ? orders.filter(o => o.status === filterStatus) : orders;
+
+  const STATUS_MAP = {
+    pending: { label: '待发货', color: 'bg-amber-100 text-amber-700' },
+    in_transit: { label: '运输中', color: 'bg-blue-100 text-blue-700' },
+    received: { label: '已入库', color: 'bg-green-100 text-green-700' },
+    cancelled: { label: '已取消', color: 'bg-gray-200 text-gray-600' }
+  };
+
+  const advanceStatus = async (order, next) => {
+    order.status = next;
+    if (next === 'received') {
+      order.receive_date = today();
+      order.receive_user = user.username;
+    }
+    await dbApi.update('purchase_order', order);
+    await services.log(user.username, 'PURCHASE_'+next.toUpperCase(), order.order_no, `订单状态推进到 ${next}`);
+    Toast.success('已更新');
+    reload();
+  };
+
+  // 统计
+  const totalAmount = orders.reduce((s,o) => s + (o.total_amount||0), 0);
+  const pendingCnt = orders.filter(o => o.status === 'pending' || o.status === 'in_transit').length;
+  const receivedCnt = orders.filter(o => o.status === 'received').length;
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex justify-between items-center">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-800">采购订单</h2>
+          <p className="text-sm text-gray-500 mt-1">管理设备采购流程，跟踪订单状态</p>
+        </div>
+        <Btn type="primary" onClick={() => setCreating(true)}>+ 新建采购订单</Btn>
+      </div>
+
+      <div className="grid grid-cols-4 gap-4">
+        <StatCard title="订单总数" value={orders.length} sub="累计创建" color="blue"/>
+        <StatCard title="进行中" value={pendingCnt} sub="待发货+运输中" color="amber"/>
+        <StatCard title="已入库" value={receivedCnt} sub="完成验收" color="green"/>
+        <StatCard title="累计金额" value={fmtMoney(totalAmount)} sub="所有订单" color="indigo"/>
+      </div>
+
+      <div className="bg-white rounded-lg shadow border">
+        <div className="px-4 py-3 border-b flex gap-2 items-center">
+          <span className="text-sm text-gray-600">状态筛选：</span>
+          <button onClick={() => setFilterStatus('')}
+            className={`px-3 py-1 text-xs rounded ${!filterStatus ? 'bg-blue-600 text-white' : 'bg-gray-100'}`}>全部</button>
+          {Object.entries(STATUS_MAP).map(([k,v]) =>
+            <button key={k} onClick={() => setFilterStatus(k)}
+              className={`px-3 py-1 text-xs rounded ${filterStatus===k ? 'bg-blue-600 text-white' : 'bg-gray-100'}`}>{v.label}</button>
+          )}
+        </div>
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="text-left px-3 py-2">订单号</th>
+              <th className="text-left px-3 py-2">设备品类</th>
+              <th className="text-center px-3 py-2">数量</th>
+              <th className="text-right px-3 py-2">单价</th>
+              <th className="text-right px-3 py-2">总额</th>
+              <th className="text-left px-3 py-2">供应商</th>
+              <th className="text-left px-3 py-2">目标桥梁</th>
+              <th className="text-left px-3 py-2">下单日期</th>
+              <th className="text-center px-3 py-2">状态</th>
+              <th className="text-center px-3 py-2">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 ?
+              <tr><td colSpan="10" className="text-center py-8 text-gray-400">暂无订单</td></tr> :
+              filtered.map(o => {
+                const st = STATUS_MAP[o.status] || STATUS_MAP.pending;
+                const cat = DEVICE_CATEGORIES.find(c => c.code === o.category);
+                const br = bridges.find(b => b.id === o.bridge_id);
+                return (
+                  <tr key={o.id} className="border-t hover:bg-gray-50">
+                    <td className="px-3 py-2 font-mono text-xs text-blue-600">{o.order_no}</td>
+                    <td className="px-3 py-2">{cat?.name || o.category}</td>
+                    <td className="text-center px-3 py-2">{o.quantity}</td>
+                    <td className="text-right px-3 py-2">{fmtMoney(o.unit_price)}</td>
+                    <td className="text-right px-3 py-2 font-semibold text-gray-800">{fmtMoney(o.total_amount)}</td>
+                    <td className="px-3 py-2 text-xs">{o.supplier}</td>
+                    <td className="px-3 py-2 text-xs">{br?.bridge_name || '-'}</td>
+                    <td className="px-3 py-2 text-xs">{o.order_date}</td>
+                    <td className="text-center px-3 py-2">
+                      <span className={`text-xs px-2 py-0.5 rounded ${st.color}`}>{st.label}</span>
+                    </td>
+                    <td className="text-center px-3 py-2">
+                      {o.status === 'pending' &&
+                        <button onClick={() => advanceStatus(o, 'in_transit')}
+                          className="text-xs text-blue-600 hover:underline">发货</button>}
+                      {o.status === 'in_transit' &&
+                        <button onClick={() => advanceStatus(o, 'received')}
+                          className="text-xs text-green-600 hover:underline">入库登记</button>}
+                      {o.status === 'received' && <span className="text-xs text-gray-400">已完成</span>}
+                    </td>
+                  </tr>
+                );
+              })
+            }
+          </tbody>
+        </table>
+      </div>
+
+      {creating && <CreatePurchaseModal bridges={bridges} onClose={() => setCreating(false)}
+        onSaved={() => { setCreating(false); reload(); }}/>}
+    </div>
+  );
+}
+
+function CreatePurchaseModal({ bridges, onClose, onSaved }) {
+  const { user } = useApp();
+  const [category, setCategory] = useState('SUP_CABLE');
+  const [qty, setQty] = useState(1);
+  const [price, setPrice] = useState(50000);
+  const [supplier, setSupplier] = useState('柳州欧维姆机械股份有限公司');
+  const [bridgeId, setBridgeId] = useState(bridges[0]?.id || '');
+
+  const submit = async () => {
+    if (Number(qty) <= 0 || Number(price) <= 0) { Toast.error('数量和单价必须大于零'); return; }
+    const orderNo = 'PO-' + new Date().getFullYear() + '-' + String(Math.floor(Math.random()*9000)+1000);
+    await dbApi.insert('purchase_order', {
+      id:uid(), order_no:orderNo, category, quantity:Number(qty), unit_price:Number(price),
+      total_amount: Number(qty) * Number(price), supplier, bridge_id:bridgeId,
+      order_date:today(), order_user:user.username,
+      status:'pending', receive_date:null, receive_user:null,
+      create_time:now()
+    });
+    await services.log(user.username, 'CREATE_PURCHASE', orderNo,
+      `${category} × ${qty}，金额 ${fmtMoney(Number(qty)*Number(price))}`);
+    Toast.success('采购订单已创建');
+    onSaved();
+  };
+
+  return (
+    <Modal open title="新建采购订单" onClose={onClose} width="520px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="primary" onClick={submit}>提交订单</Btn></>}>
+      <div className="space-y-3">
+        <SelectField label="设备品类*" value={category} onChange={setCategory}
+          options={DEVICE_CATEGORIES.map(c => ({v:c.code, l:c.name}))}/>
+        <div className="grid grid-cols-2 gap-3">
+          <Field type="number" label="数量*" value={qty} onChange={setQty}/>
+          <Field type="number" label="单价 (¥)*" value={price} onChange={setPrice}/>
+        </div>
+        <Field label="供应商*" value={supplier} onChange={setSupplier}/>
+        <SelectField label="目标桥梁*" value={bridgeId} onChange={setBridgeId}
+          options={bridges.map(b => ({v:b.id, l:b.bridge_name}))}/>
+        <div className="text-sm bg-blue-50 border border-blue-200 rounded p-3">
+          <div>预计总额：<b className="text-blue-700">{fmtMoney(Number(qty) * Number(price))}</b></div>
+          <div className="text-xs text-gray-500 mt-1">订单创建后状态为「待发货」，可手动推进到「运输中」「已入库」</div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+
+// =============================================================================
+// ScrapPage - 报废技术鉴定（论文核心功能）
+// =============================================================================
+function ScrapPage() {
+  const { user } = useApp();
+  const [devices, setDevices] = useState([]);
+  const [bridges, setBridges] = useState([]);
+  const [decisions, setDecisions] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [tab, setTab] = useState('candidate'); // candidate | history
+
+  const reload = async () => {
+    const allDev = await dbApi.all('device_archive');
+    setDevices(allDev);
+    setBridges(await dbApi.all('bridge'));
+    const dec = await dbApi.all('scrap_decision');
+    dec.sort((a,b) => (b.create_time||'').localeCompare(a.create_time||''));
+    setDecisions(dec);
+  };
+  useEffect(() => { reload(); }, []);
+
+  // 候选清单：使用中或故障中、且年龄超过 60% 设计寿命，或残值率低于阈值
+  const candidates = devices.filter(d => {
+    if (d.status === 'scrapped') return false;
+    const cat = DEVICE_CATEGORIES.find(c => c.code === d.category);
+    if (!cat) return false;
+    const ageY = ((new Date() - new Date(d.commission_date)) / (365*86400*1000));
+    const ratio = ageY / cat.designLife;
+    const decided = decisions.find(x => x.device_id === d.id && x.status !== 'rejected');
+    return ratio >= 0.6 && !decided;
+  }).sort((a,b) => {
+    const ca = DEVICE_CATEGORIES.find(c => c.code === a.category);
+    const cb = DEVICE_CATEGORIES.find(c => c.code === b.category);
+    const ratioA = ((new Date() - new Date(a.commission_date))/(365*86400*1000)) / (ca?.designLife||10);
+    const ratioB = ((new Date() - new Date(b.commission_date))/(365*86400*1000)) / (cb?.designLife||10);
+    return ratioB - ratioA;
+  });
+
+  if (activeId) {
+    const dev = devices.find(d => d.id === activeId);
+    return <ScrapDetailPage device={dev} bridges={bridges} onBack={() => { setActiveId(null); reload(); }}/>;
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <div>
+        <h2 className="text-2xl font-bold text-gray-800">报废技术鉴定</h2>
+        <p className="text-sm text-gray-500 mt-1">基于 TCO 模型对临近寿命的设备进行技术经济评估</p>
+      </div>
+
+      <div className="grid grid-cols-4 gap-4">
+        <StatCard title="待鉴定" value={candidates.length} sub="超过 60% 设计寿命" color="amber"/>
+        <StatCard title="鉴定中" value={decisions.filter(d => d.status==='pending').length} sub="等待审批" color="blue"/>
+        <StatCard title="已批准报废" value={decisions.filter(d => d.status==='approved').length} sub="实际报废" color="red"/>
+        <StatCard title="已驳回" value={decisions.filter(d => d.status==='rejected').length} sub="继续使用" color="gray"/>
+      </div>
+
+      <div className="bg-white rounded-lg shadow border">
+        <div className="border-b flex">
+          <button onClick={() => setTab('candidate')}
+            className={`px-5 py-3 text-sm border-b-2 ${tab==='candidate' ? 'border-red-500 text-red-600 font-semibold' : 'border-transparent text-gray-500'}`}>
+            待鉴定清单 ({candidates.length})
+          </button>
+          <button onClick={() => setTab('history')}
+            className={`px-5 py-3 text-sm border-b-2 ${tab==='history' ? 'border-red-500 text-red-600 font-semibold' : 'border-transparent text-gray-500'}`}>
+            鉴定历史 ({decisions.length})
+          </button>
+        </div>
+
+        {tab === 'candidate' ?
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs">
+              <tr>
+                <th className="text-left px-3 py-2">设备编号</th>
+                <th className="text-left px-3 py-2">名称</th>
+                <th className="text-left px-3 py-2">所属桥梁</th>
+                <th className="text-left px-3 py-2">分类</th>
+                <th className="text-center px-3 py-2">投运</th>
+                <th className="text-center px-3 py-2">使用率</th>
+                <th className="text-center px-3 py-2">残值估算</th>
+                <th className="text-center px-3 py-2">状态</th>
+                <th className="text-center px-3 py-2">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.length === 0 ?
+                <tr><td colSpan="9" className="text-center py-8 text-gray-400">无待鉴定设备</td></tr> :
+                candidates.map(d => {
+                  const cat = DEVICE_CATEGORIES.find(c => c.code === d.category);
+                  const br = bridges.find(b => b.id === d.bridge_id);
+                  const ageY = ((new Date() - new Date(d.commission_date))/(365*86400*1000));
+                  const ratio = ageY / (cat?.designLife||10);
+                  const residual = services.calcResidual(d);
+                  const ratioColor = ratio >= 1.0 ? 'text-red-600 font-bold' : ratio >= 0.85 ? 'text-orange-600 font-semibold' : 'text-amber-600';
+                  return (
+                    <tr key={d.id} className="border-t hover:bg-gray-50">
+                      <td className="px-3 py-2 font-mono text-xs">{d.device_code}</td>
+                      <td className="px-3 py-2">{d.device_name}</td>
+                      <td className="px-3 py-2">{br?.bridge_name || '-'}</td>
+                      <td className="px-3 py-2 text-xs">{cat?.name}</td>
+                      <td className="text-center px-3 py-2 text-xs">{d.commission_date}</td>
+                      <td className={`text-center px-3 py-2 ${ratioColor}`}>{(ratio*100).toFixed(0)}%</td>
+                      <td className="text-center px-3 py-2 text-xs">{fmtMoney(residual)}</td>
+                      <td className="text-center px-3 py-2"><Tag status={d.status}/></td>
+                      <td className="text-center px-3 py-2">
+                        <button onClick={() => setActiveId(d.id)}
+                          className="text-xs text-red-600 hover:underline font-medium">技术鉴定</button>
+                      </td>
+                    </tr>
+                  );
+                })
+              }
+            </tbody>
+          </table>
+        :
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs">
+              <tr>
+                <th className="text-left px-3 py-2">鉴定日期</th>
+                <th className="text-left px-3 py-2">设备</th>
+                <th className="text-left px-3 py-2">鉴定结论</th>
+                <th className="text-right px-3 py-2">建议方案</th>
+                <th className="text-center px-3 py-2">鉴定人</th>
+                <th className="text-center px-3 py-2">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {decisions.length === 0 ?
+                <tr><td colSpan="6" className="text-center py-8 text-gray-400">暂无记录</td></tr> :
+                decisions.map(dc => {
+                  const dev = devices.find(d => d.id === dc.device_id);
+                  const stColor = dc.status === 'approved' ? 'bg-red-100 text-red-700' :
+                    dc.status === 'rejected' ? 'bg-gray-200 text-gray-600' : 'bg-amber-100 text-amber-700';
+                  return (
+                    <tr key={dc.id} className="border-t hover:bg-gray-50">
+                      <td className="px-3 py-2 text-xs">{dc.decision_date}</td>
+                      <td className="px-3 py-2">{dev?.device_name} <span className="text-xs text-gray-400">{dev?.device_code}</span></td>
+                      <td className="px-3 py-2 text-xs max-w-md truncate">{dc.conclusion}</td>
+                      <td className="text-right px-3 py-2 text-xs">
+                        <span className={dc.recommendation === 'replace' ? 'text-red-600 font-semibold' : 'text-blue-600'}>
+                          {dc.recommendation === 'replace' ? '更换报废' : '继续维修'}
+                        </span>
+                      </td>
+                      <td className="text-center px-3 py-2 text-xs">{dc.decision_user}</td>
+                      <td className="text-center px-3 py-2">
+                        <span className={`text-xs px-2 py-0.5 rounded ${stColor}`}>
+                          {dc.status === 'approved' ? '已批准' : dc.status === 'rejected' ? '已驳回' : '待审批'}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })
+              }
+            </tbody>
+          </table>
+        }
+      </div>
+    </div>
+  );
+}
+
+function ScrapDetailPage({ device, bridges, onBack }) {
+  const { user } = useApp();
+  const [tco, setTco] = useState(null);
+  const [repairCost, setRepairCost] = useState(0);
+  const [targetYears, setTargetYears] = useState(3);
+  const [conclusion, setConclusion] = useState('');
+  const [recommendation, setRecommendation] = useState('replace');
+  const [loading, setLoading] = useState(true);
+
+  const cat = DEVICE_CATEGORIES.find(c => c.code === device.category);
+  const br = bridges.find(b => b.id === device.bridge_id);
+  const ageY = ((new Date() - new Date(device.commission_date))/(365*86400*1000));
+  const ratio = ageY / (cat?.designLife||10);
+  const residual = services.calcResidual(device);
+
+  const recompute = async (rc, ty) => {
+    setLoading(true);
+    const result = await services.tcoDecision(device.id, ty, rc);
+    setTco(result);
+    if (result?.recommendation) setRecommendation(result.recommendation);
+    if (result?.conclusion && !conclusion) setConclusion(result.conclusion);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    // 默认估算修复费用：年维修费 × 1.5
+    const initRC = Math.max(50000, Math.round((device.annual_repair_cost || 5000) * 1.5));
+    setRepairCost(initRC);
+    recompute(initRC, 3);
+  }, []);
+
+  const submitDecision = async () => {
+    if (!conclusion.trim()) { Toast.error('请填写鉴定结论'); return; }
+    const decId = uid();
+    await dbApi.insert('scrap_decision', {
+      id: decId,
+      device_id: device.id,
+      decision_date: today(),
+      decision_user: user.username,
+      tco_repair: tco?.repair?.tco || 0,
+      tco_replace: tco?.replace?.tco || 0,
+      residual_value: residual,
+      target_years: targetYears,
+      repair_estimate: Number(repairCost),
+      conclusion,
+      recommendation,
+      status: 'pending',
+      create_time: now()
+    });
+    // 待审批
+    await dbApi.insert('scrap_approval', {
+      id: uid(),
+      decision_id: decId,
+      status: 'pending',
+      approve_user: null,
+      approve_date: null,
+      approve_comment: null,
+      create_time: now()
+    });
+    await services.log(user.username, 'SCRAP_DECISION', device.device_code,
+      `结论：${recommendation === 'replace' ? '建议报废更换' : '建议继续维修'}`);
+    Toast.success('鉴定结论已提交，等待管理员审批');
+    onBack();
+  };
+
+  return (
+    <div className="p-6">
+      <button onClick={onBack} className="text-sm text-gray-500 hover:text-blue-600 mb-3">← 返回鉴定列表</button>
+      <h2 className="text-2xl font-bold text-gray-800 mb-1">报废技术鉴定</h2>
+      <p className="text-sm text-gray-500 mb-4">基于 TCO 全寿命成本模型分析「修」与「换」的经济性差异</p>
+
+      {ratio >= 1.0 &&
+        <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-4 rounded">
+          <div className="font-semibold text-red-700">⚠ 寿命警戒</div>
+          <div className="text-sm text-red-600 mt-1">该设备已超过设计使用寿命（{(ratio*100).toFixed(0)}%），强烈建议报废更换以避免安全风险</div>
+        </div>
+      }
+
+      <div className="grid grid-cols-3 gap-4">
+        {/* 左 1/3 - 设备基本信息 */}
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg shadow border p-4">
+            <div className="text-sm font-bold text-gray-700 mb-3 border-b pb-2">设备信息</div>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-gray-500">编号</span><span className="font-mono text-xs">{device.device_code}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">名称</span><span>{device.device_name}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">分类</span><span>{cat?.name}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">所属桥梁</span><span>{br?.bridge_name}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">投运日期</span><span>{device.commission_date}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">已用年限</span><span className="font-semibold">{ageY.toFixed(1)} 年</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">设计寿命</span><span>{cat?.designLife} 年</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">使用率</span>
+                <span className={ratio >= 1.0 ? 'text-red-600 font-bold' : 'text-amber-600 font-semibold'}>{(ratio*100).toFixed(0)}%</span>
+              </div>
+              <div className="flex justify-between"><span className="text-gray-500">购置价</span><span>{fmtMoney(device.purchase_price)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">残值估算</span><span className="text-green-600 font-semibold">{fmtMoney(residual)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">年保养费</span><span>{fmtMoney(device.annual_maintain_cost)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">年维修费</span><span>{fmtMoney(device.annual_repair_cost)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">本月故障</span><span>{device.fault_count_month || 0} 次</span></div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-lg shadow border p-4">
+            <div className="text-sm font-bold text-gray-700 mb-3 border-b pb-2">鉴定参数</div>
+            <div className="space-y-3 text-sm">
+              <Field type="number" label="预计修复费用 (¥)" value={repairCost}
+                onChange={v => { setRepairCost(v); recompute(Number(v), targetYears); }}/>
+              <Field type="number" label="服役目标年限" value={targetYears}
+                onChange={v => { setTargetYears(Number(v)); recompute(Number(repairCost), Number(v)); }}/>
+            </div>
+          </div>
+        </div>
+
+        {/* 中 1/3 - TCO 决策面板 */}
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg shadow border p-4">
+            <div className="text-sm font-bold text-gray-700 mb-3 border-b pb-2">TCO 决策分析</div>
+            {loading ? <div className="text-center text-gray-400 py-8">计算中...</div> :
+              !tco ? <div className="text-center text-gray-400 py-8">无数据</div> :
+              <div className="space-y-3">
+                {tco.preflag &&
+                  <div className="bg-red-50 border border-red-200 rounded p-3 text-sm">
+                    <div className="font-bold text-red-700">🚨 阈值前置触发</div>
+                    <div className="text-xs text-red-600 mt-1">{tco.preflag}</div>
+                  </div>
+                }
+                <div className={`border rounded p-3 ${tco.recommendation === 'repair' ? 'bg-blue-50 border-blue-300' : 'bg-gray-50 border-gray-200'}`}>
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="font-semibold text-blue-700">方案 A：维修延寿</span>
+                    {tco.recommendation === 'repair' && <span className="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">推荐</span>}
+                  </div>
+                  <div className="space-y-1 text-xs text-gray-600">
+                    <div className="flex justify-between"><span>修复一次性投入</span><span>{fmtMoney(tco.repair?.repair_cost)}</span></div>
+                    <div className="flex justify-between"><span>{targetYears}年保养费</span><span>{fmtMoney(tco.repair?.maintain_cost)}</span></div>
+                    <div className="flex justify-between"><span>{targetYears}年维修费</span><span>{fmtMoney(tco.repair?.future_repair)}</span></div>
+                    <div className="flex justify-between"><span>残值回收</span><span className="text-green-600">-{fmtMoney(tco.repair?.salvage)}</span></div>
+                  </div>
+                  <div className="border-t mt-2 pt-2 flex justify-between items-baseline">
+                    <span className="text-sm font-semibold">TCO 总成本</span>
+                    <span className="text-lg font-bold text-blue-600">{fmtMoney(tco.repair?.tco)}</span>
+                  </div>
+                </div>
+
+                <div className={`border rounded p-3 ${tco.recommendation === 'replace' ? 'bg-red-50 border-red-300' : 'bg-gray-50 border-gray-200'}`}>
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="font-semibold text-red-700">方案 B：更换报废</span>
+                    {tco.recommendation === 'replace' && <span className="text-xs px-2 py-0.5 bg-red-600 text-white rounded">推荐</span>}
+                  </div>
+                  <div className="space-y-1 text-xs text-gray-600">
+                    <div className="flex justify-between"><span>新设备购置</span><span>{fmtMoney(tco.replace?.new_price)}</span></div>
+                    <div className="flex justify-between"><span>{targetYears}年保养费</span><span>{fmtMoney(tco.replace?.maintain_cost)}</span></div>
+                    <div className="flex justify-between"><span>{targetYears}年维修费</span><span>{fmtMoney(tco.replace?.future_repair)}</span></div>
+                    <div className="flex justify-between"><span>旧设备残值</span><span className="text-green-600">-{fmtMoney(tco.replace?.salvage)}</span></div>
+                  </div>
+                  <div className="border-t mt-2 pt-2 flex justify-between items-baseline">
+                    <span className="text-sm font-semibold">TCO 总成本</span>
+                    <span className="text-lg font-bold text-red-600">{fmtMoney(tco.replace?.tco)}</span>
+                  </div>
+                </div>
+
+                <div className="bg-amber-50 border border-amber-200 rounded p-3">
+                  <div className="text-xs text-amber-700">
+                    <b>差额分析：</b>
+                    {tco.diff > 0 ?
+                      <>更换比维修多花 <b>{fmtMoney(Math.abs(tco.diff))}</b>，但新设备可服役 {cat?.designLife} 年</> :
+                      <>更换比维修节省 <b>{fmtMoney(Math.abs(tco.diff))}</b>，建议尽早更换</>
+                    }
+                  </div>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+
+        {/* 右 1/3 - 鉴定结论提交 */}
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg shadow border p-4">
+            <div className="text-sm font-bold text-gray-700 mb-3 border-b pb-2">鉴定结论</div>
+            <div className="space-y-3">
+              <div>
+                <label className="text-sm text-gray-600 mb-1 block">建议方案</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={() => setRecommendation('repair')}
+                    className={`py-2 rounded border text-sm ${recommendation==='repair' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white border-gray-300 text-gray-700'}`}>
+                    继续维修
+                  </button>
+                  <button onClick={() => setRecommendation('replace')}
+                    className={`py-2 rounded border text-sm ${recommendation==='replace' ? 'bg-red-600 text-white border-red-600' : 'bg-white border-gray-300 text-gray-700'}`}>
+                    报废更换
+                  </button>
+                </div>
+              </div>
+              <TextareaField label="鉴定意见 *" value={conclusion} onChange={setConclusion}/>
+              <div className="text-xs text-gray-500 bg-gray-50 rounded p-2">
+                提交后将进入待审批状态，由系统管理员最终批准
+              </div>
+              <Btn type="danger" onClick={submitDecision}>提交鉴定结论</Btn>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// =============================================================================
+// StatsPage - 统计分析（4 大图表面板）
+// =============================================================================
+function StatsPage() {
+  const [days, setDays] = useState(180);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const reload = async () => {
+    setLoading(true);
+    setData(await services.statsOverview(days));
+    setLoading(false);
+  };
+  useEffect(() => { reload(); }, [days]);
+
+  if (loading || !data) return <div className="p-6 text-gray-500">加载统计数据...</div>;
+
+  // 1. 设备类别分布
+  const catChart = {
+    title: { text: '设备类别分布', left: 'left', textStyle: { fontSize: 14 } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 130, right: 30, top: 40, bottom: 30 },
+    xAxis: { type: 'value' },
+    yAxis: { type: 'category', data: data.categoryDist.map(c => c.name), axisLabel: { fontSize: 11 } },
+    series: [{
+      type: 'bar',
+      data: data.categoryDist.map(c => c.count),
+      itemStyle: { color: '#3b82f6', borderRadius: [0,4,4,0] },
+      label: { show: true, position: 'right', fontSize: 11 }
+    }]
+  };
+
+  // 2. 维护费用 12 月趋势 - 双 Y
+  const trendChart = {
+    title: { text: '维护费用月度趋势（最近12月）', left: 'left', textStyle: { fontSize: 14 } },
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['保养费', '维修费'], right: 20, top: 5 },
+    grid: { left: 60, right: 60, top: 60, bottom: 30 },
+    xAxis: { type: 'category', data: data.costTrend.map(t => t.label) },
+    yAxis: { type: 'value', name: '费用 (元)', axisLabel: { formatter: v => v >= 10000 ? (v/10000).toFixed(0)+'万' : v }},
+    series: [
+      { name:'保养费', type:'line', smooth:true, data: data.costTrend.map(t => t.maintain),
+        itemStyle: { color:'#10b981' }, areaStyle: { color: 'rgba(16,185,129,0.15)' } },
+      { name:'维修费', type:'line', smooth:true, data: data.costTrend.map(t => t.repair),
+        itemStyle: { color:'#ef4444' }, areaStyle: { color: 'rgba(239,68,68,0.15)' } }
+    ]
+  };
+
+  // 3. 故障率排行
+  const faultChart = {
+    title: { text: '设备故障率排行（按分类）', left: 'left', textStyle: { fontSize: 14 } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: p => `${p[0].name}: ${p[0].value} 次故障` },
+    grid: { left: 130, right: 30, top: 40, bottom: 30 },
+    xAxis: { type: 'value' },
+    yAxis: { type: 'category', data: data.faultRank.map(f => f.name), axisLabel: { fontSize: 11 } },
+    series: [{
+      type: 'bar',
+      data: data.faultRank.map(f => f.count),
+      itemStyle: {
+        color: p => {
+          const colors = ['#dc2626','#ea580c','#f59e0b','#eab308','#84cc16','#22c55e','#10b981','#06b6d4','#3b82f6','#8b5cf6'];
+          return colors[p.dataIndex] || '#94a3b8';
+        },
+        borderRadius: [0,4,4,0]
+      },
+      label: { show: true, position: 'right', fontSize: 11 }
+    }]
+  };
+
+  // 4. 分类 TCO 对比
+  const tcoChart = {
+    title: { text: '分类设备累计成本对比 (TCO)', left: 'left', textStyle: { fontSize: 14 } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: p => p.map(x => `${x.seriesName}: ${(x.value/10000).toFixed(1)}万`).join('<br>') },
+    legend: { data: ['购置成本', '保养累计', '维修累计'], right: 20, top: 5 },
+    grid: { left: 70, right: 30, top: 60, bottom: 60 },
+    xAxis: { type: 'category', data: data.tcoCompare.map(c => c.name), axisLabel: { rotate: 30, fontSize: 11 } },
+    yAxis: { type: 'value', axisLabel: { formatter: v => (v/10000).toFixed(0)+'万' }},
+    series: [
+      { name: '购置成本', type: 'bar', stack: 'total', data: data.tcoCompare.map(c => c.purchase),
+        itemStyle: { color: '#6366f1' } },
+      { name: '保养累计', type: 'bar', stack: 'total', data: data.tcoCompare.map(c => c.maintain),
+        itemStyle: { color: '#10b981' } },
+      { name: '维修累计', type: 'bar', stack: 'total', data: data.tcoCompare.map(c => c.repair),
+        itemStyle: { color: '#ef4444' } }
+    ]
+  };
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex justify-between items-center">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-800">统计分析</h2>
+          <p className="text-sm text-gray-500 mt-1">基于真实数据计算的关键指标，所有数值由数据库聚合得出</p>
+        </div>
+        <div className="flex gap-2">
+          {[
+            { v: 30, l: '近30天' },
+            { v: 90, l: '近3月' },
+            { v: 180, l: '近半年' },
+            { v: 365, l: '近1年' }
+          ].map(o =>
+            <button key={o.v} onClick={() => setDays(o.v)}
+              className={`px-3 py-1.5 text-sm rounded ${days===o.v ? 'bg-blue-600 text-white' : 'bg-white border text-gray-600'}`}>
+              {o.l}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 8 项关键率 - 真实计算 */}
+      <div className="bg-white rounded-lg shadow border p-5">
+        <div className="text-sm font-bold text-gray-700 mb-4">📊 核心运营指标（真实计算）</div>
+        <div className="grid grid-cols-4 gap-4">
+          <RateCard title="设备在用率" value={data.rates.inUseRate} unit="%" hint={`${data.rates.inUseCount}/${data.rates.totalCount}`} color="blue"/>
+          <RateCard title="设备完好率" value={data.rates.healthyRate} unit="%" hint="非故障非报废" color="green"/>
+          <RateCard title="保养完成率" value={data.rates.maintainRate} unit="%" hint={`${days}天周期内`} color="indigo"/>
+          <RateCard title="工单关闭率" value={data.rates.closeRate} unit="%" hint="故障工单" color="emerald"/>
+          <RateCard title="年故障率" value={data.rates.faultRate} unit="%" hint="按设备数年化" color="amber"/>
+          <RateCard title="MTBF 平均无故障" value={data.rates.mtbf} unit="天" hint="Mean Time Between Failures" color="cyan"/>
+          <RateCard title="MTTR 平均修复" value={data.rates.mttr} unit="小时" hint="Mean Time To Repair" color="purple"/>
+          <RateCard title="累计运维成本" value={(data.rates.totalCost/10000).toFixed(1)} unit="万元" hint={`${days}天周期`} color="rose"/>
+        </div>
+      </div>
+
+      {/* 4 大图表 */}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-white rounded-lg shadow border p-4">
+          <Chart option={catChart} height="320px"/>
+        </div>
+        <div className="bg-white rounded-lg shadow border p-4">
+          <Chart option={trendChart} height="320px"/>
+        </div>
+        <div className="bg-white rounded-lg shadow border p-4">
+          <Chart option={faultChart} height="320px"/>
+        </div>
+        <div className="bg-white rounded-lg shadow border p-4">
+          <Chart option={tcoChart} height="320px"/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RateCard({ title, value, unit, hint, color }) {
+  const colors = {
+    blue: 'bg-blue-50 border-blue-200 text-blue-700',
+    green: 'bg-green-50 border-green-200 text-green-700',
+    indigo: 'bg-indigo-50 border-indigo-200 text-indigo-700',
+    emerald: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+    amber: 'bg-amber-50 border-amber-200 text-amber-700',
+    cyan: 'bg-cyan-50 border-cyan-200 text-cyan-700',
+    purple: 'bg-purple-50 border-purple-200 text-purple-700',
+    rose: 'bg-rose-50 border-rose-200 text-rose-700',
+  };
+  return (
+    <div className={`rounded-lg border p-3 ${colors[color] || colors.blue}`}>
+      <div className="text-xs text-gray-500 font-medium">{title}</div>
+      <div className="flex items-baseline gap-1 mt-2">
+        <span className="text-2xl font-bold">{value}</span>
+        <span className="text-xs">{unit}</span>
+      </div>
+      <div className="text-xs text-gray-400 mt-1">{hint}</div>
+    </div>
+  );
+}
+
+
+// =============================================================================
+// ConfigPage - 阈值参数配置（管理员）
+// =============================================================================
+function ConfigPage() {
+  const { user } = useApp();
+  const [cfg, setCfg] = useState({});
+  const [loading, setLoading] = useState(true);
+
+  const reload = async () => {
+    const all = await dbApi.all('sys_config');
+    const map = {};
+    all.forEach(c => map[c.key] = c.value);
+    setCfg(map);
+    setLoading(false);
+  };
+  useEffect(() => { reload(); }, []);
+
+  const updateConfig = async (key, val, label) => {
+    const exist = await dbApi.get('sys_config', key);
+    if (exist) {
+      exist.value = val;
+      exist.update_time = now();
+      exist.update_user = user.username;
+      await dbApi.update('sys_config', exist);
+    } else {
+      await dbApi.insert('sys_config', { key, value: val, label,
+        update_time: now(), update_user: user.username });
+    }
+    await services.log(user.username, 'UPDATE_CONFIG', key, `新值: ${val}`);
+    setCfg({ ...cfg, [key]: val });
+    Toast.success(label + ' 已更新');
+  };
+
+  if (loading) return <div className="p-6 text-gray-500">加载中...</div>;
+
+  const sliders = [
+    {
+      key: 'repair_residual_threshold',
+      label: '修复成本/残值阈值',
+      desc: '当「修复一次性投入 ≥ 残值 × 该比例」时触发更换建议',
+      min: 0.30, max: 0.80, step: 0.05,
+      default: 0.60,
+      format: v => (v*100).toFixed(0) + '%'
+    },
+    {
+      key: 'life_warning_ratio',
+      label: '寿命警戒阈值',
+      desc: '当设备使用年限 / 设计寿命 ≥ 该比例时进入「寿命警戒」状态',
+      min: 0.60, max: 0.95, step: 0.05,
+      default: 0.85,
+      format: v => (v*100).toFixed(0) + '%'
+    },
+    {
+      key: 'market_discount_ratio',
+      label: '市场折扣系数',
+      desc: '残值估算 = 直线折旧值 × 该系数，反映二手市场流动性',
+      min: 0.50, max: 1.00, step: 0.05,
+      default: 0.80,
+      format: v => (v*100).toFixed(0) + '%'
+    }
+  ];
+
+  return (
+    <div className="p-6 space-y-4">
+      <div>
+        <h2 className="text-2xl font-bold text-gray-800">阈值参数配置</h2>
+        <p className="text-sm text-gray-500 mt-1">配置 TCO 决策模型的关键阈值参数（仅管理员可见）</p>
+      </div>
+
+      <div className="bg-white rounded-lg shadow border divide-y">
+        {sliders.map(s => {
+          const cur = cfg[s.key] != null ? Number(cfg[s.key]) : s.default;
+          return (
+            <div key={s.key} className="p-5">
+              <div className="flex justify-between items-baseline mb-1">
+                <div>
+                  <div className="font-semibold text-gray-800">{s.label}</div>
+                  <div className="text-xs text-gray-500 mt-1">{s.desc}</div>
+                </div>
+                <div className="text-2xl font-bold text-blue-600">{s.format(cur)}</div>
+              </div>
+              <div className="mt-4 flex items-center gap-3">
+                <span className="text-xs text-gray-500 w-12 text-right">{s.format(s.min)}</span>
+                <input type="range" min={s.min} max={s.max} step={s.step} value={cur}
+                  onChange={e => updateConfig(s.key, Number(e.target.value), s.label)}
+                  className="flex-1 accent-blue-600 cursor-pointer"/>
+                <span className="text-xs text-gray-500 w-12">{s.format(s.max)}</span>
+              </div>
+              <div className="text-xs text-gray-400 mt-2">
+                取值范围：{s.format(s.min)} ~ {s.format(s.max)} ｜ 默认：{s.format(s.default)}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="bg-amber-50 border border-amber-200 rounded p-3 text-sm text-amber-700">
+        💡 修改阈值会即时影响后续 TCO 决策结果与寿命警戒提示，但不会改变历史鉴定记录
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// UsersPage - 用户与角色管理（管理员）
+// =============================================================================
+function UsersPage() {
+  const { user: currentUser } = useApp();
+  const [users, setUsers] = useState([]);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  const reload = async () => {
+    const list = await dbApi.all('sys_user');
+    list.sort((a,b) => (a.username||'').localeCompare(b.username||''));
+    setUsers(list);
+  };
+  useEffect(() => { reload(); }, []);
+
+  const toggleStatus = async (u) => {
+    if (u.username === currentUser.username) { Toast.error('不能禁用自己的账户'); return; }
+    u.status = u.status === 1 ? 0 : 1;
+    await dbApi.update('sys_user', u);
+    await services.log(currentUser.username, 'TOGGLE_USER', u.username, '状态：'+u.status);
+    Toast.success('已更新');
+    reload();
+  };
+
+  const resetPwd = async (u) => {
+    if (!confirm(`确定要重置「${u.username}」的密码为 123456 吗？`)) return;
+    u.password = hashPwd('123456');
+    u.update_time = now();
+    await dbApi.update('sys_user', u);
+    await services.log(currentUser.username, 'RESET_PWD', u.username, '密码已重置为 123456');
+    Toast.success('密码已重置为 123456');
+  };
+
+  const removeUser = async (u) => {
+    if (u.username === currentUser.username) { Toast.error('不能删除自己'); return; }
+    if (!confirm(`确定要删除「${u.username}」吗？此操作不可撤销`)) return;
+    await dbApi.delete('sys_user', u.id);
+    await services.log(currentUser.username, 'DELETE_USER', u.username, '账户已删除');
+    Toast.success('已删除');
+    reload();
+  };
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex justify-between items-center">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-800">用户与角色</h2>
+          <p className="text-sm text-gray-500 mt-1">管理系统账号、密码与权限角色</p>
+        </div>
+        <Btn type="primary" onClick={() => setCreating(true)}>+ 新建账户</Btn>
+      </div>
+
+      <div className="grid grid-cols-5 gap-3">
+        {ROLES.map(r => {
+          const cnt = users.filter(u => u.role_code === r.code).length;
+          return (
+            <div key={r.code} className={`rounded-lg border p-3 ${r.color}`}>
+              <div className="text-xs">{r.name}</div>
+              <div className="text-2xl font-bold mt-1">{cnt}</div>
+              <div className="text-xs opacity-70 mt-1">个账户</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="bg-white rounded-lg shadow border">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="text-left px-3 py-2">账号</th>
+              <th className="text-left px-3 py-2">姓名</th>
+              <th className="text-left px-3 py-2">角色</th>
+              <th className="text-left px-3 py-2">手机</th>
+              <th className="text-left px-3 py-2">最后登录</th>
+              <th className="text-center px-3 py-2">状态</th>
+              <th className="text-center px-3 py-2">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map(u => {
+              const role = ROLES.find(r => r.code === u.role_code);
+              return (
+                <tr key={u.id} className="border-t hover:bg-gray-50">
+                  <td className="px-3 py-2 font-mono text-xs">
+                    {u.username} {u.username === currentUser.username && <span className="text-blue-600 text-xs">(我)</span>}
+                  </td>
+                  <td className="px-3 py-2">{u.real_name}</td>
+                  <td className="px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded ${role?.color}`}>{role?.name}</span>
+                  </td>
+                  <td className="px-3 py-2 text-xs">{u.phone || '-'}</td>
+                  <td className="px-3 py-2 text-xs">{u.last_login_at ? u.last_login_at.slice(0,16).replace('T',' ') : '-'}</td>
+                  <td className="text-center px-3 py-2">
+                    <span className={`text-xs px-2 py-0.5 rounded ${u.status===1 ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-600'}`}>
+                      {u.status === 1 ? '正常' : '禁用'}
+                    </span>
+                  </td>
+                  <td className="text-center px-3 py-2 space-x-2">
+                    <button onClick={() => setEditing(u)} className="text-xs text-blue-600 hover:underline">编辑</button>
+                    <button onClick={() => resetPwd(u)} className="text-xs text-amber-600 hover:underline">重置密码</button>
+                    <button onClick={() => toggleStatus(u)} className="text-xs text-gray-600 hover:underline">
+                      {u.status === 1 ? '禁用' : '启用'}
+                    </button>
+                    <button onClick={() => removeUser(u)} className="text-xs text-red-600 hover:underline">删除</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {(creating || editing) &&
+        <UserEditModal user={editing} onClose={() => { setCreating(false); setEditing(null); }}
+          onSaved={() => { setCreating(false); setEditing(null); reload(); }}/>
+      }
+    </div>
+  );
+}
+
+function UserEditModal({ user, onClose, onSaved }) {
+  const { user: currentUser } = useApp();
+  const editing = !!user;
+  const [username, setUsername] = useState(user?.username || '');
+  const [realName, setRealName] = useState(user?.real_name || '');
+  const [phone, setPhone] = useState(user?.phone || '');
+  const [roleCode, setRoleCode] = useState(user?.role_code || 'maintainer');
+  const [password, setPassword] = useState('');
+
+  const submit = async () => {
+    if (!username.trim() || !realName.trim()) { Toast.error('请填写账号和姓名'); return; }
+    if (!editing && !password.trim()) { Toast.error('新建账户必须设置密码'); return; }
+
+    if (editing) {
+      user.real_name = realName;
+      user.phone = phone;
+      user.role_code = roleCode;
+      if (password.trim()) user.password = hashPwd(password);
+      user.update_time = now();
+      await dbApi.update('sys_user', user);
+      await services.log(currentUser.username, 'UPDATE_USER', username, '资料更新');
+      Toast.success('已更新');
+    } else {
+      // 检查重复
+      const all = await dbApi.all('sys_user');
+      if (all.some(x => x.username === username.trim())) {
+        Toast.error('账号已存在'); return;
+      }
+      await dbApi.insert('sys_user', {
+        id: uid(), username: username.trim(),
+        password: hashPwd(password),
+        real_name: realName, phone, role_code: roleCode,
+        status: 1, last_login_at: null,
+        create_time: now(), update_time: now()
+      });
+      await services.log(currentUser.username, 'CREATE_USER', username, '新增 '+roleCode);
+      Toast.success('已创建');
+    }
+    onSaved();
+  };
+
+  return (
+    <Modal open title={editing ? '编辑账户' : '新建账户'} onClose={onClose} width="480px"
+      footer={<><Btn onClick={onClose}>取消</Btn><Btn type="primary" onClick={submit}>保存</Btn></>}>
+      <div className="space-y-3">
+        <Field label="账号*" value={username} onChange={setUsername} disabled={editing}/>
+        <Field label="姓名*" value={realName} onChange={setRealName}/>
+        <Field label="手机号" value={phone} onChange={setPhone}/>
+        <SelectField label="角色*" value={roleCode} onChange={setRoleCode}
+          options={ROLES.map(r => ({v:r.code, l:r.name}))}/>
+        <Field type="password" label={editing ? '新密码（留空则不修改）' : '初始密码*'}
+          value={password} onChange={setPassword}/>
+      </div>
+    </Modal>
+  );
+}
+
+// =============================================================================
+// AuditPage - 审计日志（管理员）
+// =============================================================================
+function AuditPage() {
+  const [logs, setLogs] = useState([]);
+  const [filter, setFilter] = useState('');
+  const [actionFilter, setActionFilter] = useState('');
+
+  const reload = async () => {
+    const list = await dbApi.all('sys_audit_log');
+    list.sort((a,b) => (b.create_time||'').localeCompare(a.create_time||''));
+    setLogs(list.slice(0, 500));
+  };
+  useEffect(() => { reload(); }, []);
+
+  const filtered = logs.filter(l => {
+    if (filter && !(l.username||'').includes(filter) && !(l.target||'').includes(filter)) return false;
+    if (actionFilter && l.action !== actionFilter) return false;
+    return true;
+  });
+
+  const actions = [...new Set(logs.map(l => l.action))].sort();
+
+  return (
+    <div className="p-6 space-y-4">
+      <div>
+        <h2 className="text-2xl font-bold text-gray-800">审计日志</h2>
+        <p className="text-sm text-gray-500 mt-1">所有写操作均会记录到审计表，便于责任追溯（最多展示最近 500 条）</p>
+      </div>
+
+      <div className="bg-white rounded-lg shadow border">
+        <div className="px-4 py-3 border-b flex gap-3 items-center">
+          <input type="text" placeholder="搜索用户名 / 目标..." value={filter}
+            onChange={e => setFilter(e.target.value)}
+            className="flex-1 px-3 py-1.5 border rounded text-sm"/>
+          <select value={actionFilter} onChange={e => setActionFilter(e.target.value)}
+            className="px-3 py-1.5 border rounded text-sm">
+            <option value="">全部操作类型</option>
+            {actions.map(a => <option key={a} value={a}>{a}</option>)}
+          </select>
+          <span className="text-xs text-gray-500">共 {filtered.length} 条</span>
+        </div>
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="text-left px-3 py-2 w-44">时间</th>
+              <th className="text-left px-3 py-2 w-32">用户</th>
+              <th className="text-left px-3 py-2 w-36">操作</th>
+              <th className="text-left px-3 py-2 w-44">对象</th>
+              <th className="text-left px-3 py-2">详情</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 ?
+              <tr><td colSpan="5" className="text-center py-8 text-gray-400">无日志</td></tr> :
+              filtered.map(l =>
+                <tr key={l.id} className="border-t hover:bg-gray-50">
+                  <td className="px-3 py-2 text-xs font-mono">{(l.create_time||'').slice(0,19).replace('T',' ')}</td>
+                  <td className="px-3 py-2 text-xs font-semibold text-blue-600">{l.username}</td>
+                  <td className="px-3 py-2 text-xs">
+                    <span className="px-2 py-0.5 bg-blue-50 text-blue-700 rounded">{l.action}</span>
+                  </td>
+                  <td className="px-3 py-2 text-xs text-gray-600">{l.target || '-'}</td>
+                  <td className="px-3 py-2 text-xs text-gray-500">{l.detail || '-'}</td>
+                </tr>
+              )
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+// =============================================================================
+// TopBar - 顶部状态条
+// =============================================================================
+function TopBar() {
+  const { user, logout } = useApp();
+  const role = ROLES.find(r => r.code === user.role_code);
+  const [now2, setNow2] = useState(new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow2(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="bg-white border-b h-14 px-6 flex items-center justify-between">
+      <div className="text-sm text-gray-500">
+        🌉 桥梁设备全生命周期管理系统
+      </div>
+      <div className="flex items-center gap-5">
+        <span className="text-xs text-gray-500 font-mono">
+          {now2.toLocaleString('zh-CN', { hour12: false })}
+        </span>
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-xs font-bold">
+            {(user.real_name || user.username).slice(0,1)}
+          </div>
+          <div className="text-sm">
+            <div className="font-semibold text-gray-700">{user.real_name || user.username}</div>
+            <div className="text-xs text-gray-400">
+              <span className={`px-1.5 py-0.5 rounded text-xs ${role?.color}`}>{role?.name}</span>
+            </div>
+          </div>
+          <button onClick={() => { if (confirm('确定要退出登录吗？')) logout(); }}
+            className="ml-2 text-xs text-gray-500 hover:text-red-600 px-2 py-1">退出</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// MainLayout - 已登录后的主框架
+// =============================================================================
+function MainLayout() {
+  const { menu } = useApp();
+  return (
+    <div className="h-screen flex bg-gray-50">
+      <Sidebar/>
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <TopBar/>
+        <div className="flex-1 overflow-y-auto">
+          {menu === 'dashboard' && <DashboardPage/>}
+          {menu === 'lifecycle' && <LifecyclePage/>}
+          {menu === 'bridges' && <BridgesPage/>}
+          {menu === 'devices' && <DevicesPage/>}
+          {menu === 'maintain' && <MaintainPage/>}
+          {menu === 'fault' && <FaultPage/>}
+          {menu === 'purchase' && <PurchasePage/>}
+          {menu === 'scrap' && <ScrapPage/>}
+          {menu === 'stats' && <StatsPage/>}
+          {menu === 'config' && <ConfigPage/>}
+          {menu === 'users' && <UsersPage/>}
+          {menu === 'audit' && <AuditPage/>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// App - 根组件
+// =============================================================================
+function App() {
+  const [user, setUser] = useState(null);
+  const [menu, setMenu] = useState('dashboard');
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      await openDB();
+      await seedDataIfEmpty();
+      // 尝试从 sessionStorage 恢复登录态
+      try {
+        const cached = sessionStorage.getItem('bridge_user');
+        if (cached) {
+          const u = JSON.parse(cached);
+          // 验证账户仍存在且未禁用
+          const fresh = await dbApi.all('sys_user');
+          const found = fresh.find(x => x.username === u.username && x.status === 1);
+          if (found) setUser(found);
+        }
+      } catch (e) { /* 忽略 */ }
+      setReady(true);
+    })();
+  }, []);
+
+  const login = async (username, password) => {
+    const all = await dbApi.all('sys_user');
+    const u = all.find(x => x.username === username.trim());
+    if (!u) { Toast.error('账号不存在'); return false; }
+    if (u.status !== 1) { Toast.error('账户已被禁用，请联系管理员'); return false; }
+    if (u.password !== hashPwd(password)) { Toast.error('密码错误'); return false; }
+    u.last_login_at = now();
+    await dbApi.update('sys_user', u);
+    await services.log(u.username, 'LOGIN', '系统', '登录成功');
+    try { sessionStorage.setItem('bridge_user', JSON.stringify(u)); } catch(e) {}
+    setUser(u);
+    setMenu('dashboard');
+    Toast.success('欢迎，' + (u.real_name || u.username));
+    return true;
+  };
+
+  const logout = async () => {
+    if (user) await services.log(user.username, 'LOGOUT', '系统', '退出登录');
+    try { sessionStorage.removeItem('bridge_user'); } catch(e) {}
+    setUser(null);
+  };
+
+  if (!ready) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-gradient-to-br from-blue-600 to-indigo-800">
+        <div className="text-white text-center">
+          <div className="text-4xl mb-4">🌉</div>
+          <div className="text-lg">桥梁设备全生命周期管理系统</div>
+          <div className="text-sm opacity-80 mt-2">正在初始化数据库...</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <AppContext.Provider value={{ user, setUser, menu, setMenu, login, logout }}>
+      <ToastContainer/>
+      {user ? <MainLayout/> : <LoginPage onLogin={(u) => { try { sessionStorage.setItem('bridge_user', JSON.stringify(u)); } catch(e) {}; setUser(u); setMenu('dashboard'); }}/>}
+    </AppContext.Provider>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+
+</script>
+</body>
+</html>
