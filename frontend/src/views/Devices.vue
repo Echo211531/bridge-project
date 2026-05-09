@@ -130,6 +130,7 @@ import { listDevices, getDevice, createDevice, updateDevice, listCategories, lis
 import { listBridges } from '@/api/bridge'
 import Modal from '@/components/common/Modal.vue'
 import Drawer from '@/components/common/Drawer.vue'
+import DeviceDetail from '@/components/business/DeviceDetail.vue'
 import StatusTag from '@/components/common/Tag.vue'
 
 const router = useRouter()
@@ -275,4 +276,4 @@ async function handleSubmit() {
   margin-top: 20px;
   justify-content: flex-end;
 }
-</script>
+</style>

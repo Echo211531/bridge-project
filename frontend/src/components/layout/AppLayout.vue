@@ -1,18 +1,15 @@
 <template>
   <div class="app-layout">
-    <!-- 侧边栏 -->
     <Sidebar :collapsed="isCollapsed" @toggle="toggleSidebar" />
 
-    <!-- 主内容区 -->
     <div class="main-container" :class="{ collapsed: isCollapsed }">
-      <!-- 顶部栏 -->
       <Header :collapsed="isCollapsed" @toggle="toggleSidebar" />
-
-      <!-- 内容区 -->
-      <main class="content">
+      <main class="content scrollbar-thin">
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
-            <component :is="Component" />
+            <div class="page-shell">
+              <component :is="Component" />
+            </div>
           </transition>
         </router-view>
       </main>
@@ -21,20 +18,12 @@
 </template>
 
 <script setup>
-/**
- * 应用布局组件
- *
- * @author 程国忠
- * @since 2026-05-09
- */
 import { ref } from 'vue'
 import Sidebar from './Sidebar.vue'
 import Header from './Header.vue'
 
-// 侧边栏折叠状态
 const isCollapsed = ref(false)
 
-// 切换折叠状态
 function toggleSidebar() {
   isCollapsed.value = !isCollapsed.value
 }
@@ -43,8 +32,8 @@ function toggleSidebar() {
 <style scoped>
 .app-layout {
   display: flex;
-  height: 100vh;
-  width: 100%;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #e2e8f0 0%, #f8fafc 280px);
 }
 
 .main-container {
@@ -53,27 +42,42 @@ function toggleSidebar() {
   flex-direction: column;
   margin-left: 220px;
   transition: margin-left 0.3s ease;
-  background-color: #f5f7fa;
+  min-height: 100vh;
 }
 
 .main-container.collapsed {
-  margin-left: 64px;
+  margin-left: 88px;
 }
 
 .content {
   flex: 1;
-  padding: 20px;
+  padding: 24px;
   overflow-y: auto;
 }
 
-/* 过渡动画 */
+.page-shell {
+  min-height: 100%;
+}
+
 .fade-enter-active,
 .fade-leave-active {
-  transition: opacity 0.2s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease;
 }
 
 .fade-enter-from,
 .fade-leave-to {
   opacity: 0;
+  transform: translateY(6px);
+}
+
+@media (max-width: 768px) {
+  .main-container,
+  .main-container.collapsed {
+    margin-left: 0;
+  }
+
+  .content {
+    padding: 16px;
+  }
 }
 </style>

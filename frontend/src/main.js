@@ -6,7 +6,9 @@ import 'element-plus/dist/index.css'
 
 import App from './App.vue'
 import router from './router'
+import './router/guards'
 import './styles/main.css'
+import { useUserStore } from './stores/user'
 
 /**
  * 创建 Vue 应用实例
@@ -14,10 +16,14 @@ import './styles/main.css'
 const app = createApp(App)
 
 // 注册 Pinia 状态管理
-app.use(createPinia())
+const pinia = createPinia()
+app.use(pinia)
 
 // 注册 Vue Router
 app.use(router)
+
+// 恢复登录态，确保刷新后仍能拿到用户和菜单信息
+useUserStore(pinia).restoreUserInfo()
 
 // 注册 Element Plus
 app.use(ElementPlus)

@@ -1,17 +1,16 @@
 <template>
   <div class="todo-list">
-    <el-empty v-if="!items.length" description="暂无待办事项" />
-    <div v-else>
-      <div v-for="item in items" :key="item.type" class="todo-item">
-        <div class="todo-header">
-          <el-tag :type="getUrgencyType(item.urgency)" size="small">
-            {{ item.typeName }}
-          </el-tag>
-          <span class="todo-count">{{ item.count }} 项</span>
+    <el-empty v-if="!normalizedItems.length" description="暂无待办事项" />
+    <div v-else class="todo-group">
+      <div v-for="item in normalizedItems" :key="item.key" class="todo-item">
+        <div class="todo-badge" :class="item.colorClass">{{ item.typeLabel }}</div>
+        <div class="todo-body">
+          <div class="todo-title">{{ item.title }}</div>
+          <div class="todo-desc">{{ item.desc }}</div>
         </div>
-        <div class="todo-title">{{ item.title }}</div>
-        <div class="todo-deadline" v-if="item.deadline">
-          截止: {{ formatDate(item.deadline) }}
+        <div class="todo-side">
+          <strong>{{ item.countText }}</strong>
+          <span v-if="item.deadline">截止 {{ formatDate(item.deadline) }}</span>
         </div>
       </div>
     </div>
@@ -19,25 +18,35 @@
 </template>
 
 <script setup>
-/**
- * 待办事项列表组件
- *
- * @author 程国忠
- * @since 2026-05-09
- */
-defineProps({
-  items: Array
+import { computed } from 'vue'
+
+const props = defineProps({
+  items: {
+    type: Array,
+    default: () => []
+  }
 })
 
-function getUrgencyType(urgency) {
-  const types = {
-    urgent: 'danger',
-    high: 'warning',
-    medium: 'primary',
-    low: 'info'
-  }
-  return types[urgency] || 'info'
-}
+const normalizedItems = computed(() => {
+  return props.items.map((item, index) => {
+    const urgencyMap = {
+      urgent: 'danger',
+      high: 'warning',
+      medium: 'primary',
+      low: 'info'
+    }
+
+    return {
+      key: item.relatedId || `${item.type || 'todo'}-${index}`,
+      typeLabel: item.typeName || item.type || '待办',
+      title: item.title || '待处理事项',
+      desc: item.relatedId ? `关联编号：${item.relatedId}` : '请尽快处理该事项',
+      deadline: item.deadline,
+      countText: `${item.count || 1} 项`,
+      colorClass: urgencyMap[item.urgency] || 'info'
+    }
+  })
+})
 
 function formatDate(date) {
   if (!date) return ''
@@ -48,40 +57,90 @@ function formatDate(date) {
 
 <style scoped>
 .todo-list {
-  max-height: 300px;
+  max-height: 360px;
   overflow-y: auto;
 }
 
+.todo-group {
+  display: grid;
+  gap: 12px;
+}
+
 .todo-item {
-  padding: 12px;
-  border-bottom: 1px solid #ebeef5;
-}
-
-.todo-item:last-child {
-  border-bottom: none;
-}
-
-.todo-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 18px;
+  background: #fff;
+  transition: all 0.2s ease;
 }
 
-.todo-count {
-  font-size: 14px;
-  font-weight: 600;
-  color: #303133;
+.todo-item:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(15, 23, 42, 0.06);
+}
+
+.todo-badge {
+  min-width: 92px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.todo-badge.danger {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.todo-badge.warning {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.todo-badge.primary {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.todo-badge.info {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.todo-body {
+  flex: 1;
 }
 
 .todo-title {
   font-size: 14px;
-  color: #606266;
+  font-weight: 600;
+  color: #0f172a;
 }
 
-.todo-deadline {
+.todo-desc {
+  margin-top: 6px;
   font-size: 12px;
-  color: #909399;
-  margin-top: 4px;
+  color: #64748b;
 }
-</script>
+
+.todo-side {
+  min-width: 72px;
+  text-align: right;
+}
+
+.todo-side strong {
+  display: block;
+  color: #0f172a;
+}
+
+.todo-side span {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #64748b;
+}
+</style>

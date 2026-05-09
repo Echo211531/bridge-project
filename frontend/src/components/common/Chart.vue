@@ -3,12 +3,6 @@
 </template>
 
 <script setup>
-/**
- * ECharts图表容器组件
- *
- * @author 程国忠
- * @since 2026-05-09
- */
 import { ref, onMounted, onUnmounted, watch } from 'vue'
 import * as echarts from 'echarts'
 
@@ -22,6 +16,7 @@ const props = defineProps({
 
 const chartRef = ref(null)
 let chartInstance = null
+let resizeHandler = null
 
 onMounted(() => {
   if (chartRef.value) {
@@ -30,11 +25,21 @@ onMounted(() => {
       chartInstance.setOption(props.option)
     }
   }
+
+  resizeHandler = () => {
+    chartInstance?.resize()
+  }
+
+  window.addEventListener('resize', resizeHandler)
 })
 
 onUnmounted(() => {
+  if (resizeHandler) {
+    window.removeEventListener('resize', resizeHandler)
+  }
   if (chartInstance) {
     chartInstance.dispose()
+    chartInstance = null
   }
 })
 

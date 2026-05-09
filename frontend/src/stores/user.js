@@ -37,11 +37,23 @@ export const useUserStore = defineStore('user', () => {
 
   // 从 sessionStorage 恢复用户信息
   function restoreUserInfo() {
-    const stored = sessionStorage.getItem('userInfo')
-    if (stored) {
+    try {
+      const stored = sessionStorage.getItem('userInfo')
+      if (!stored) {
+        return
+      }
+
       const info = JSON.parse(stored)
+      if (!info || typeof info !== 'object') {
+        clearUserInfo()
+        return
+      }
+
       userInfo.value = info
-      menus.value = info.menus || []
+      menus.value = Array.isArray(info.menus) ? info.menus : []
+    } catch (error) {
+      console.warn('恢复登录态失败，已清理本地缓存:', error)
+      clearUserInfo()
     }
   }
 

@@ -175,4 +175,4 @@ defineProps({
   margin: 4px 0;
   color: #e6a23c;
 }
-</script>
+</style>

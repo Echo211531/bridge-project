@@ -2,7 +2,7 @@
   <div class="purchase-page">
     <el-card class="search-card">
       <el-form :inline="true">
-        <el-form-item label="订单编码">
+        <el-form-item label="订单编号">
           <el-input v-model="searchForm.orderCode" clearable placeholder="输入订单编码搜索" />
         </el-form-item>
         <el-form-item label="订单状态">
@@ -24,10 +24,10 @@
     </div>
 
     <el-card class="table-card">
-      <el-table :data="orderList" v-loading="loading" stripe>
-        <el-table-column prop="orderCode" label="订单编码" width="180" />
-        <el-table-column prop="deviceName" label="设备名称" width="150" />
-        <el-table-column prop="deviceCategory" label="设备分类" width="100" />
+      <el-table :data="filteredOrderList" v-loading="loading" stripe>
+        <el-table-column prop="orderNo" label="订单编号" width="180" />
+        <el-table-column prop="bridgeName" label="目标桥梁" width="150" />
+        <el-table-column prop="categoryName" label="设备分类" width="120" />
         <el-table-column prop="quantity" label="数量" width="80" />
         <el-table-column prop="unitPrice" label="单价(元)" width="100">
           <template #default="{ row }">{{ row.unitPrice?.toFixed(2) }}</template>
@@ -52,9 +52,6 @@
             <el-button type="success" link v-if="row.status === 'shipping'" @click="handleReceive(row)">
               收货
             </el-button>
-            <el-button type="danger" link v-if="row.status === 'pending'" @click="handleDelete(row)">
-              删除
-            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -64,12 +61,14 @@
     <!-- 新增弹窗 -->
     <Modal v-model="dialogVisible" title="新增采购订单" @confirm="handleSubmit">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="100px">
-        <el-form-item label="设备名称" prop="deviceName">
-          <el-input v-model="form.deviceName" />
-        </el-form-item>
-        <el-form-item label="设备分类" prop="deviceCategory">
-          <el-select v-model="form.deviceCategory">
+        <el-form-item label="设备分类" prop="category">
+          <el-select v-model="form.category">
             <el-option v-for="cat in categories" :key="cat.code" :label="cat.name" :value="cat.code" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="目标桥梁" prop="bridgeId">
+          <el-select v-model="form.bridgeId">
+            <el-option v-for="bridge in bridges" :key="bridge.id" :label="bridge.bridgeName" :value="bridge.id" />
           </el-select>
         </el-form-item>
         <el-form-item label="数量" prop="quantity">
@@ -90,9 +89,9 @@
     <!-- 详情弹窗 -->
     <Drawer v-model="detailVisible" title="订单详情" width="600px">
       <el-descriptions :column="1" border v-if="currentOrder">
-        <el-descriptions-item label="订单编码">{{ currentOrder.orderCode }}</el-descriptions-item>
-        <el-descriptions-item label="设备名称">{{ currentOrder.deviceName }}</el-descriptions-item>
-        <el-descriptions-item label="设备分类">{{ currentOrder.deviceCategory }}</el-descriptions-item>
+        <el-descriptions-item label="订单编号">{{ currentOrder.orderNo }}</el-descriptions-item>
+        <el-descriptions-item label="目标桥梁">{{ currentOrder.bridgeName || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="设备分类">{{ currentOrder.categoryName }}</el-descriptions-item>
         <el-descriptions-item label="数量">{{ currentOrder.quantity }}</el-descriptions-item>
         <el-descriptions-item label="单价">{{ currentOrder.unitPrice?.toFixed(2) }} 元</el-descriptions-item>
         <el-descriptions-item label="总金额">{{ currentOrder.totalAmount?.toFixed(2) }} 元</el-descriptions-item>
@@ -108,9 +107,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { computed, ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listOrders, createOrder, shipOrder, receiveOrder, deleteOrder } from '@/api/purchase'
+import { listPurchases, createPurchase, updateStatus } from '@/api/purchase'
+import { listBridges } from '@/api/bridge'
 import { listCategories } from '@/api/device'
 import Modal from '@/components/common/Modal.vue'
 import Drawer from '@/components/common/Drawer.vue'
@@ -119,6 +119,7 @@ import StatusTag from '@/components/common/Tag.vue'
 const loading = ref(false)
 const orderList = ref([])
 const categories = ref([])
+const bridges = ref([])
 const pageNum = ref(1)
 const pageSize = ref(10)
 const total = ref(0)
@@ -127,11 +128,11 @@ const searchForm = reactive({ orderCode: '', status: '' })
 
 const dialogVisible = ref(false)
 const formRef = ref(null)
-const form = reactive({ deviceName: '', deviceCategory: '', quantity: 1, unitPrice: 0, supplier: '', remark: '' })
+const form = reactive({ category: '', quantity: 1, unitPrice: 0, supplier: '', bridgeId: '' })
 
 const rules = {
-  deviceName: [{ required: true, message: '请输入设备名称', trigger: 'blur' }],
-  deviceCategory: [{ required: true, message: '请选择设备分类', trigger: 'change' }],
+  category: [{ required: true, message: '请选择设备分类', trigger: 'change' }],
+  bridgeId: [{ required: true, message: '请选择目标桥梁', trigger: 'change' }],
   quantity: [{ required: true, message: '请输入数量', trigger: 'blur' }],
   unitPrice: [{ required: true, message: '请输入单价', trigger: 'blur' }]
 }
@@ -139,14 +140,22 @@ const rules = {
 const detailVisible = ref(false)
 const currentOrder = ref(null)
 
+const filteredOrderList = computed(() => {
+  const keyword = searchForm.orderCode.trim()
+  return orderList.value.filter(order => {
+    const matchesCode = !keyword || order.orderNo?.includes(keyword)
+    return matchesCode
+  })
+})
+
 onMounted(async () => {
-  await Promise.all([loadOrders(), loadCategories()])
+  await Promise.all([loadOrders(), loadCategories(), loadBridges()])
 })
 
 async function loadOrders() {
   loading.value = true
   try {
-    const data = await listOrders({ pageNum: pageNum.value, pageSize: pageSize.value, ...searchForm })
+    const data = await listPurchases({ pageNum: pageNum.value, pageSize: pageSize.value, status: searchForm.status })
     orderList.value = data.records || []
     total.value = data.total || 0
   } finally {
@@ -159,6 +168,11 @@ async function loadCategories() {
   categories.value = data || []
 }
 
+async function loadBridges() {
+  const data = await listBridges({ pageNum: 1, pageSize: 200 })
+  bridges.value = data.records || []
+}
+
 function formatTime(time) {
   if (!time) return ''
   const date = new Date(time)
@@ -169,14 +183,14 @@ function handleSearch() { pageNum.value = 1; loadOrders() }
 function handleReset() { searchForm.orderCode = ''; searchForm.status = ''; pageNum.value = 1; loadOrders() }
 
 function handleAdd() {
-  Object.assign(form, { deviceName: '', deviceCategory: '', quantity: 1, unitPrice: 0, supplier: '', remark: '' })
+  Object.assign(form, { category: '', quantity: 1, unitPrice: 0, supplier: '', bridgeId: '' })
   dialogVisible.value = true
 }
 
 async function handleSubmit() {
   try {
     await formRef.value.validate()
-    await createOrder(form)
+    await createPurchase(form)
     ElMessage.success('采购订单创建成功')
     dialogVisible.value = false
     loadOrders()
@@ -191,7 +205,7 @@ function handleView(row) {
 async function handleShip(row) {
   try {
     await ElMessageBox.confirm('确认发货该订单吗?', '提示', { type: 'warning' })
-    await shipOrder(row.id)
+    await updateStatus(row.id, { status: 'shipping' })
     ElMessage.success('订单已发货')
     loadOrders()
   } catch (error) { if (error !== 'cancel') console.error('发货失败:', error) }
@@ -200,19 +214,10 @@ async function handleShip(row) {
 async function handleReceive(row) {
   try {
     await ElMessageBox.confirm('确认收货该订单吗?', '提示', { type: 'warning' })
-    await receiveOrder(row.id)
+    await updateStatus(row.id, { status: 'received' })
     ElMessage.success('订单已收货')
     loadOrders()
   } catch (error) { if (error !== 'cancel') console.error('收货失败:', error) }
-}
-
-async function handleDelete(row) {
-  try {
-    await ElMessageBox.confirm('确定要删除该订单吗?', '提示', { type: 'warning' })
-    await deleteOrder(row.id)
-    ElMessage.success('删除成功')
-    loadOrders()
-  } catch (error) { if (error !== 'cancel') console.error('删除失败:', error) }
 }
 </script>
 
