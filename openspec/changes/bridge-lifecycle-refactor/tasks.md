@@ -180,41 +180,41 @@
 
 ## 14. 统计分析模块
 
-- [ ] 14.1 创建 DashboardVO、StatsOverviewVO 视图对象
-- [ ] 14.2 创建 StatsService 服务类（8 项关键率）
-- [ ] 14.3 创建 StatsController 控制器
-- [ ] 14.4 实现设备在用率计算
-- [ ] 14.5 实现设备完好率计算
-- [ ] 14.6 实现年故障率计算
-- [ ] 14.7 实现保养完成率计算
-- [ ] 14.8 实现工单关闭率计算
-- [ ] 14.9 实现 MTBF 计算
-- [ ] 14.10 实现 MTTR 计算
-- [ ] 14.11 实现累计运维成本计算
-- [ ] 14.12 实现 30 天费用趋势查询
-- [ ] 14.13 实现待办事项查询
-- [ ] 14.14 实现设备分类分布统计
-- [ ] 14.15 实现故障排行统计
-- [ ] 14.16 实现 TCO 对比统计
+- [x] 14.1 创建 DashboardVO、StatsOverviewVO 视图对象
+- [x] 14.2 创建 StatsService 服务类（8 项关键率）
+- [x] 14.3 创建 StatsController 控制器
+- [x] 14.4 实现设备在用率计算
+- [x] 14.5 实现设备完好率计算
+- [x] 14.6 实现年故障率计算
+- [x] 14.7 实现保养完成率计算
+- [x] 14.8 实现工单关闭率计算
+- [x] 14.9 实现 MTBF 计算
+- [x] 14.10 实现 MTTR 计算
+- [x] 14.11 实现累计运维成本计算
+- [x] 14.12 实现 30 天费用趋势查询
+- [x] 14.13 实现待办事项查询
+- [x] 14.14 实现设备分类分布统计
+- [x] 14.15 实现故障排行统计
+- [x] 14.16 实现 TCO 对比统计
 
 ## 15. 系统配置模块
 
-- [ ] 15.1 创建 ConfigVO、ConfigUpdateDTO 数据传输对象
-- [ ] 15.2 创建 ConfigService 服务类
-- [ ] 15.3 创建 ConfigController 控制器
-- [ ] 15.4 实现配置查询
-- [ ] 15.5 实现 TCO 阈值配置更新（残值、修复、寿命警戒线）
-- [ ] 15.6 实现配置值范围约束校验
-- [ ] 15.7 实现配置实时生效
+- [x] 15.1 创建 ConfigVO、ConfigUpdateDTO 数据传输对象
+- [x] 15.2 创建 ConfigService 服务类
+- [x] 15.3 创建 ConfigController 控制器
+- [x] 15.4 实现配置查询
+- [x] 15.5 实现 TCO 阈值配置更新（残值、修复、寿命警戒线）
+- [x] 15.6 实现配置值范围约束校验
+- [x] 15.7 实现配置实时生效
 
 ## 16. 审计日志模块
 
-- [ ] 16.1 创建 AuditLogVO 视图对象
-- [ ] 16.2 创建 AuditService 服务类
-- [ ] 16.3 创建 AuditController 控制器
-- [ ] 16.4 实现审计日志分页查询
-- [ ] 16.5 实现审计日志自动记录（所有写操作）
-- [ ] 16.6 实现多条件筛选（操作类型、操作人、时间范围）
+- [x] 16.1 创建 AuditLogVO 视图对象
+- [x] 16.2 创建 AuditService 服务类
+- [x] 16.3 创建 AuditController 控制器
+- [x] 16.4 实现审计日志分页查询
+- [x] 16.5 实现审计日志自动记录（所有写操作）
+- [x] 16.6 实现多条件筛选（操作类型、操作人、时间范围）
 
 ## 17. 前端基础架构
 
@@ -224,52 +224,52 @@
 - [x] 17.4 创建 Pinia Store 入口（stores/index.js）
 - [x] 17.5 创建用户状态管理（stores/user.js）
 - [x] 17.6 创建菜单状态管理（stores/menu.js）
-- [ ] 17.7 创建布局组件（components/layout/AppLayout.vue）
-- [ ] 17.8 创建侧边栏组件（components/layout/Sidebar.vue）
-- [ ] 17.9 创建顶部栏组件（components/layout/Header.vue）
+- [x] 17.7 创建布局组件（components/layout/AppLayout.vue）
+- [x] 17.8 创建侧边栏组件（components/layout/Sidebar.vue）
+- [x] 17.9 创建顶部栏组件（components/layout/Header.vue）
 
 ## 18. 前端 API 模块
 
-- [ ] 18.1 创建登录 API（api/auth.js）
-- [ ] 18.2 创建用户管理 API（api/user.js）
-- [ ] 18.3 创建桥梁管理 API（api/bridge.js）
-- [ ] 18.4 创建设备管理 API（api/device.js）
-- [ ] 18.5 创建保养管理 API（api/maintain.js）
-- [ ] 18.6 创建故障工单 API（api/fault.js）
-- [ ] 18.7 创建采购订单 API（api/purchase.js）
-- [ ] 18.8 创建报废鉴定 API（api/scrap.js）
-- [ ] 18.9 创建生命周期 API（api/lifecycle.js）
-- [ ] 18.10 创建统计分析 API（api/stats.js）
-- [ ] 18.11 创建系统配置 API（api/config.js）
-- [ ] 18.12 创建审计日志 API（api/audit.js）
+- [x] 18.1 创建登录 API（api/auth.js）
+- [x] 18.2 创建用户管理 API（api/user.js）
+- [x] 18.3 创建桥梁管理 API（api/bridge.js）
+- [x] 18.4 创建设备管理 API（api/device.js）
+- [x] 18.5 创建保养管理 API（api/maintain.js）
+- [x] 18.6 创建故障工单 API（api/fault.js）
+- [x] 18.7 创建采购订单 API（api/purchase.js）
+- [x] 18.8 创建报废鉴定 API（api/scrap.js）
+- [x] 18.9 创建生命周期 API（api/lifecycle.js）
+- [x] 18.10 创建统计分析 API（api/stats.js）
+- [x] 18.11 创建系统配置 API（api/config.js）
+- [x] 18.12 创建审计日志 API（api/audit.js）
 
 ## 19. 前端页面开发
 
-- [ ] 19.1 创建登录页面（views/Login.vue）
-- [ ] 19.2 创建首页仪表盘（views/Dashboard.vue）
-- [ ] 19.3 创建全生命周期页面（views/Lifecycle.vue）
-- [ ] 19.4 创建桥梁管理页面（views/Bridges.vue）
-- [ ] 19.5 创建设备档案页面（views/Devices.vue）
-- [ ] 19.6 创建保养计划页面（views/Maintain.vue）
-- [ ] 19.7 创建故障工单页面（views/Fault.vue）
-- [ ] 19.8 创建采购订单页面（views/Purchase.vue）
-- [ ] 19.9 创建报废鉴定页面（views/Scrap.vue）
-- [ ] 19.10 创建报废鉴定详情页面（views/ScrapDetail.vue）
-- [ ] 19.11 创建统计分析页面（views/Stats.vue）
-- [ ] 19.12 创建系统配置页面（views/Config.vue）
-- [ ] 19.13 创建用户管理页面（views/Users.vue）
-- [ ] 19.14 创建审计日志页面（views/Audit.vue）
+- [x] 19.1 创建登录页面（views/Login.vue）
+- [x] 19.2 创建首页仪表盘（views/Dashboard.vue）
+- [x] 19.3 创建全生命周期页面（views/Lifecycle.vue）
+- [x] 19.4 创建桥梁管理页面（views/Bridges.vue）
+- [x] 19.5 创建设备档案页面（views/Devices.vue）
+- [x] 19.6 创建保养计划页面（views/Maintain.vue）
+- [x] 19.7 创建故障工单页面（views/Fault.vue）
+- [x] 19.8 创建采购订单页面（views/Purchase.vue）
+- [x] 19.9 创建报废鉴定页面（views/Scrap.vue）
+- [x] 19.10 创建报废鉴定详情页面（views/ScrapDetail.vue）
+- [x] 19.11 创建统计分析页面（views/Stats.vue）
+- [x] 19.12 创建系统配置页面（views/Config.vue）
+- [x] 19.13 创建用户管理页面（views/Users.vue）
+- [x] 19.14 创建审计日志页面（views/Audit.vue）
 
 ## 20. 前端业务组件
 
-- [ ] 20.1 创建统计卡片组件（components/common/StatCard.vue）
-- [ ] 20.2 创建 ECharts 图表容器组件（components/common/Chart.vue）
-- [ ] 20.3 创建状态标签组件（components/common/Tag.vue）
-- [ ] 20.4 创建通用弹窗组件（components/common/Modal.vue）
-- [ ] 20.5 创建通用抽屉组件（components/common/Drawer.vue）
-- [ ] 20.6 创建生命周期时间轴组件（components/business/LifecycleTimeline.vue）
-- [ ] 20.7 创建 TCO 决策面板组件（components/business/TcoPanel.vue）
-- [ ] 20.8 创建待办事项列表组件（components/business/TodoList.vue）
+- [x] 20.1 创建统计卡片组件（components/common/StatCard.vue）
+- [x] 20.2 创建 ECharts 图表容器组件（components/common/Chart.vue）
+- [x] 20.3 创建状态标签组件（components/common/Tag.vue）
+- [x] 20.4 创建通用弹窗组件（components/common/Modal.vue）
+- [x] 20.5 创建通用抽屉组件（components/common/Drawer.vue）
+- [x] 20.6 创建生命周期时间轴组件（components/business/LifecycleTimeline.vue）
+- [x] 20.7 创建 TCO 决策面板组件（components/business/TcoPanel.vue）
+- [x] 20.8 创建待办事项列表组件（components/business/TodoList.vue）
 
 ## 21. 联调测试
 
