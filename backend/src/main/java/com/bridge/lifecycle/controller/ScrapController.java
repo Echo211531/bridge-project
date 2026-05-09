@@ -1,5 +1,6 @@
 package com.bridge.lifecycle.controller;
 
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.bridge.lifecycle.Result;
 import com.bridge.lifecycle.dto.ScrapDecisionDTO;
 import com.bridge.lifecycle.entity.ScrapDecision;
@@ -33,8 +34,10 @@ public class ScrapController {
      */
     @Operation(summary = "待鉴定设备筛选（寿命警戒线、故障次数）")
     @GetMapping("/candidates")
-    public Result<List<ScrapCandidateVO>> listCandidates() {
-        return Result.success(scrapService.listCandidates());
+    public Result<Page<ScrapCandidateVO>> listCandidates(
+            @Parameter(description = "页码") @RequestParam(defaultValue = "1") Integer pageNum,
+            @Parameter(description = "每页数量") @RequestParam(defaultValue = "10") Integer pageSize) {
+        return Result.success(scrapService.listCandidates(pageNum, pageSize));
     }
 
     /**

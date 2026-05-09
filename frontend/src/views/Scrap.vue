@@ -31,6 +31,15 @@
           </template>
         </el-table-column>
       </el-table>
+      <el-pagination
+        v-model:current-page="pageNum"
+        v-model:page-size="pageSize"
+        :total="total"
+        :page-sizes="[10, 20, 50]"
+        layout="total, sizes, prev, pager, next"
+        @size-change="loadCandidates"
+        @current-change="loadCandidates"
+      />
     </el-card>
 
     <!-- TCO决策抽屉 -->
@@ -89,14 +98,15 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { listCandidates, getTcoDecision, submitDecision } from '@/api/scrap'
 import TcoPanel from '@/components/business/TcoPanel.vue'
 
-const router = useRouter()
 const loading = ref(false)
 const candidates = ref([])
+const pageNum = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
 
 const decisionVisible = ref(false)
 const currentDevice = ref(null)
@@ -117,8 +127,12 @@ onMounted(async () => {
 async function loadCandidates() {
   loading.value = true
   try {
-    const data = await listCandidates()
-    candidates.value = data || []
+    const data = await listCandidates({
+      pageNum: pageNum.value,
+      pageSize: pageSize.value
+    })
+    candidates.value = data.records || []
+    total.value = data.total || 0
   } finally {
     loading.value = false
   }
@@ -149,7 +163,7 @@ async function handleSubmitDecision() {
     await submitDecision(decisionForm)
     ElMessage.success('鉴定结论提交成功')
     decisionVisible.value = false
-    loadCandidates()
+    await loadCandidates()
   } catch (error) {
     console.error('提交失败:', error)
   }

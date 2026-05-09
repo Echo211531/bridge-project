@@ -65,7 +65,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { getDashboard } from '@/api/stats'
+import { getOverview, getCategoryDistribution, getTcoComparison } from '@/api/stats'
 import StatCard from '@/components/common/StatCard.vue'
 import Chart from '@/components/common/Chart.vue'
 
@@ -88,10 +88,14 @@ const categoryChartOption = computed(() => ({
 
 onMounted(async () => {
   try {
-    const data = await getDashboard()
-    stats.value = data.overview || {}
-    categoryDistribution.value = data.categoryDistribution || []
-    tcoComparison.value = data.tcoComparison || []
+    const [overviewData, categoryData, tcoData] = await Promise.all([
+      getOverview(),
+      getCategoryDistribution(),
+      getTcoComparison()
+    ])
+    stats.value = overviewData || {}
+    categoryDistribution.value = categoryData || []
+    tcoComparison.value = tcoData || []
   } catch (error) {
     console.error('获取统计数据失败:', error)
   }

@@ -1,6 +1,7 @@
 package com.bridge.lifecycle.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.bridge.lifecycle.dto.ScrapDecisionDTO;
 import com.bridge.lifecycle.entity.*;
 import com.bridge.lifecycle.mapper.*;
@@ -15,7 +16,11 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -44,12 +49,47 @@ public class ScrapService {
      *
      * @return 待鉴定设备列表
      */
-    public List<ScrapCandidateVO> listCandidates() {
+    public Page<ScrapCandidateVO> listCandidates(int pageNum, int pageSize) {
         // 查询所有在用设备
         List<DeviceArchive> devices = deviceArchiveMapper.selectList(
                 new LambdaQueryWrapper<DeviceArchive>()
                         .eq(DeviceArchive::getStatus, "in_use")
         );
+        if (devices.isEmpty()) {
+            return new Page<>(pageNum, pageSize, 0);
+        }
+
+        List<String> deviceIds = devices.stream()
+                .map(DeviceArchive::getId)
+                .collect(Collectors.toList());
+        Map<String, DeviceCategory> categoryMap = deviceCategoryMapper.selectList(new LambdaQueryWrapper<DeviceCategory>())
+                .stream()
+                .collect(Collectors.toMap(DeviceCategory::getCode, category -> category));
+        Map<String, Bridge> bridgeMap = bridgeMapper.selectList(new LambdaQueryWrapper<Bridge>())
+                .stream()
+                .collect(Collectors.toMap(Bridge::getId, bridge -> bridge));
+        List<FaultOrder> faultOrders = faultOrderMapper.selectList(
+                new LambdaQueryWrapper<FaultOrder>()
+                        .in(FaultOrder::getDeviceId, deviceIds)
+        );
+        List<MaintainRecord> maintainRecords = maintainRecordMapper.selectList(
+                new LambdaQueryWrapper<MaintainRecord>()
+                        .in(MaintainRecord::getDeviceId, deviceIds)
+        );
+        Map<String, Long> faultCountMap = faultOrders.stream()
+                .collect(Collectors.groupingBy(FaultOrder::getDeviceId, Collectors.counting()));
+        Map<String, BigDecimal> repairCostMap = faultOrders.stream()
+                .filter(order -> "closed".equals(order.getStatus()) && order.getRepairCost() != null)
+                .collect(Collectors.groupingBy(
+                        FaultOrder::getDeviceId,
+                        Collectors.reducing(BigDecimal.ZERO, FaultOrder::getRepairCost, BigDecimal::add)
+                ));
+        Map<String, BigDecimal> maintainCostMap = maintainRecords.stream()
+                .filter(record -> record.getActualCost() != null)
+                .collect(Collectors.groupingBy(
+                        MaintainRecord::getDeviceId,
+                        Collectors.reducing(BigDecimal.ZERO, MaintainRecord::getActualCost, BigDecimal::add)
+                ));
 
         // 获取阈值配置
         BigDecimal lifeThreshold = getConfigValue("life_threshold", new BigDecimal("80")); // 寿命警戒线(80%)
@@ -58,11 +98,21 @@ public class ScrapService {
 
         // 筛选候选设备
         List<ScrapCandidateVO> candidates = devices.stream()
-                .map(device -> convertToCandidateVO(device))
+                .map(device -> convertToCandidateVO(device, categoryMap, bridgeMap, faultCountMap, repairCostMap, maintainCostMap))
                 .filter(vo -> isCandidate(vo, lifeThreshold, residualThreshold, faultThreshold))
+                .sorted(Comparator.comparing(ScrapCandidateVO::getResidualRate, Comparator.nullsLast(BigDecimal::compareTo)))
                 .collect(Collectors.toList());
+        long total = candidates.size();
 
-        return candidates;
+        int fromIndex = Math.max((pageNum - 1) * pageSize, 0);
+        int toIndex = Math.min(fromIndex + pageSize, candidates.size());
+        List<ScrapCandidateVO> pageRecords = fromIndex >= toIndex
+                ? Collections.emptyList()
+                : candidates.subList(fromIndex, toIndex);
+
+        Page<ScrapCandidateVO> page = new Page<>(pageNum, pageSize, total);
+        page.setRecords(pageRecords);
+        return page;
     }
 
     /**
@@ -547,7 +597,14 @@ public class ScrapService {
     /**
      * 转换设备为候选VO
      */
-    private ScrapCandidateVO convertToCandidateVO(DeviceArchive device) {
+    private ScrapCandidateVO convertToCandidateVO(
+            DeviceArchive device,
+            Map<String, DeviceCategory> categoryMap,
+            Map<String, Bridge> bridgeMap,
+            Map<String, Long> faultCountMap,
+            Map<String, BigDecimal> repairCostMap,
+            Map<String, BigDecimal> maintainCostMap
+    ) {
         ScrapCandidateVO vo = new ScrapCandidateVO();
         vo.setDeviceId(device.getId());
         vo.setDeviceCode(device.getDeviceCode());
@@ -556,7 +613,7 @@ public class ScrapService {
         vo.setInUseDate(device.getInUseDate());
 
         // 获取分类信息
-        DeviceCategory category = deviceCategoryMapper.selectById(device.getCategory());
+        DeviceCategory category = categoryMap.get(device.getCategory());
         if (category != null) {
             vo.setCategoryName(category.getName());
             vo.setDesignLifeYears(category.getDesignLifeYears());
@@ -571,7 +628,7 @@ public class ScrapService {
         }
 
         // 获取桥梁信息
-        Bridge bridge = bridgeMapper.selectById(device.getBridgeId());
+        Bridge bridge = bridgeMap.get(device.getBridgeId());
         if (bridge != null) {
             vo.setBridgeName(bridge.getBridgeName());
         }
@@ -583,34 +640,19 @@ public class ScrapService {
         }
 
         // 统计故障次数和费用
-        Long faultCount = faultOrderMapper.selectCount(
-                new LambdaQueryWrapper<FaultOrder>()
-                        .eq(FaultOrder::getDeviceId, device.getId())
-        );
+        Long faultCount = faultCountMap.getOrDefault(device.getId(), 0L);
         vo.setFaultCount(faultCount.intValue());
 
-        BigDecimal totalRepairCost = faultOrderMapper.selectList(
-                new LambdaQueryWrapper<FaultOrder>()
-                        .eq(FaultOrder::getDeviceId, device.getId())
-                        .eq(FaultOrder::getStatus, "closed")
-        ).stream()
-                .map(FaultOrder::getRepairCost)
-                .filter(c -> c != null)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totalRepairCost = repairCostMap.getOrDefault(device.getId(), BigDecimal.ZERO);
         vo.setTotalRepairCost(totalRepairCost);
 
         // 统计保养费用
-        BigDecimal totalMaintainCost = maintainRecordMapper.selectList(
-                new LambdaQueryWrapper<MaintainRecord>()
-                        .eq(MaintainRecord::getDeviceId, device.getId())
-        ).stream()
-                .map(MaintainRecord::getActualCost)
-                .filter(c -> c != null)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totalMaintainCost = maintainCostMap.getOrDefault(device.getId(), BigDecimal.ZERO);
         vo.setTotalMaintainCost(totalMaintainCost);
 
         // 累计TCO
-        vo.setTotalTco(device.getPurchaseCost().add(totalRepairCost).add(totalMaintainCost));
+        BigDecimal purchaseCost = Objects.requireNonNullElse(device.getPurchaseCost(), BigDecimal.ZERO);
+        vo.setTotalTco(purchaseCost.add(totalRepairCost).add(totalMaintainCost));
 
         return vo;
     }

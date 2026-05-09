@@ -8,10 +8,11 @@ import api from './index'
 
 /**
  * 待鉴定设备筛选（寿命警戒线、故障次数）
+ * @param {Object} params - 分页参数
  * @returns {Promise} 候选设备列表
  */
-export function listCandidates() {
-  return api.get('/scrap/candidates')
+export function listCandidates(params) {
+  return api.get('/scrap/candidates', { params })
 }
 
 /**

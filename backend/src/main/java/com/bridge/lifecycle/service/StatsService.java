@@ -14,6 +14,8 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -260,6 +262,49 @@ public class StatsService {
     }
 
     /**
+     * 轻量概览统计
+     *
+     * @return 统计概览
+     */
+    public StatsOverviewVO getOverview() {
+        StatsOverviewVO overview = new StatsOverviewVO();
+        int currentYear = LocalDate.now().getYear();
+
+        overview.setTotalDevices(deviceArchiveMapper.selectCount(new LambdaQueryWrapper<DeviceArchive>()));
+        overview.setInUseRate(calculateInUseRate());
+        overview.setGoodConditionRate(calculateGoodConditionRate());
+        overview.setFaultRate(calculateFaultRate(currentYear));
+        overview.setMaintainCompletionRate(calculateMaintainCompletionRate(currentYear));
+        overview.setOrderCloseRate(calculateOrderCloseRate(currentYear));
+        overview.setMtbf(calculateMTBF(currentYear));
+        overview.setMttr(calculateMTTR(currentYear));
+        overview.setTotalOperationCost(calculateTotalOperationCost());
+
+        LocalDate now = LocalDate.now();
+        BigDecimal monthlyMaintainCost = maintainRecordMapper.selectList(
+                new LambdaQueryWrapper<MaintainRecord>()
+                        .ge(MaintainRecord::getRecordDate, now.minusDays(30))
+                        .le(MaintainRecord::getRecordDate, now)
+        ).stream()
+                .map(MaintainRecord::getActualCost)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal monthlyRepairCost = faultOrderMapper.selectList(
+                new LambdaQueryWrapper<FaultOrder>()
+                        .eq(FaultOrder::getStatus, "closed")
+                        .ge(FaultOrder::getCloseDate, now.minusDays(30))
+                        .le(FaultOrder::getCloseDate, now)
+        ).stream()
+                .map(FaultOrder::getRepairCost)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        overview.setMonthlyCost(monthlyMaintainCost.add(monthlyRepairCost));
+        return overview;
+    }
+
+    /**
      * 30天费用趋势查询
      *
      * @return 费用趋势列表
@@ -369,9 +414,12 @@ public class StatsService {
      * @return 分类分布列表
      */
     public List<CategoryStatsVO> getCategoryDistribution() {
-        Long totalDevices = deviceArchiveMapper.selectCount(
+        List<DeviceArchive> devices = deviceArchiveMapper.selectList(
                 new LambdaQueryWrapper<DeviceArchive>()
         );
+        long totalDevices = devices.size();
+        Map<String, Long> categoryCountMap = devices.stream()
+                .collect(Collectors.groupingBy(DeviceArchive::getCategory, Collectors.counting()));
 
         List<DeviceCategory> categories = deviceCategoryMapper.selectList(
                 new LambdaQueryWrapper<DeviceCategory>()
@@ -379,10 +427,7 @@ public class StatsService {
 
         return categories.stream()
                 .map(category -> {
-                    Long deviceCount = deviceArchiveMapper.selectCount(
-                            new LambdaQueryWrapper<DeviceArchive>()
-                                    .eq(DeviceArchive::getCategory, category.getCode())
-                    );
+                    Long deviceCount = categoryCountMap.getOrDefault(category.getCode(), 0L);
 
                     CategoryStatsVO vo = new CategoryStatsVO();
                     vo.setCategoryCode(category.getCode());
@@ -393,6 +438,8 @@ public class StatsService {
                         vo.setPercentage(BigDecimal.valueOf(deviceCount)
                                 .divide(BigDecimal.valueOf(totalDevices), 4, RoundingMode.HALF_UP)
                                 .multiply(BigDecimal.valueOf(100)));
+                    } else {
+                        vo.setPercentage(BigDecimal.ZERO);
                     }
 
                     return vo;
@@ -411,21 +458,22 @@ public class StatsService {
                 new LambdaQueryWrapper<DeviceArchive>()
         );
 
+        List<FaultOrder> allFaultOrders = faultOrderMapper.selectList(
+                new LambdaQueryWrapper<FaultOrder>()
+        );
+        Map<String, Long> faultCountMap = allFaultOrders.stream()
+                .collect(Collectors.groupingBy(FaultOrder::getDeviceId, Collectors.counting()));
+        Map<String, BigDecimal> closedRepairCostMap = allFaultOrders.stream()
+                .filter(order -> "closed".equals(order.getStatus()) && order.getRepairCost() != null)
+                .collect(Collectors.groupingBy(
+                        FaultOrder::getDeviceId,
+                        Collectors.reducing(BigDecimal.ZERO, FaultOrder::getRepairCost, BigDecimal::add)
+                ));
+
         List<FaultRankVO> ranking = devices.stream()
                 .map(device -> {
-                    Long faultCount = faultOrderMapper.selectCount(
-                            new LambdaQueryWrapper<FaultOrder>()
-                                    .eq(FaultOrder::getDeviceId, device.getId())
-                    );
-
-                    BigDecimal totalRepairCost = faultOrderMapper.selectList(
-                            new LambdaQueryWrapper<FaultOrder>()
-                                    .eq(FaultOrder::getDeviceId, device.getId())
-                                    .eq(FaultOrder::getStatus, "closed")
-                    ).stream()
-                            .map(FaultOrder::getRepairCost)
-                            .filter(c -> c != null)
-                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+                    Long faultCount = faultCountMap.getOrDefault(device.getId(), 0L);
+                    BigDecimal totalRepairCost = closedRepairCostMap.getOrDefault(device.getId(), BigDecimal.ZERO);
 
                     FaultRankVO vo = new FaultRankVO();
                     vo.setDeviceId(device.getId());
@@ -458,50 +506,55 @@ public class StatsService {
         List<DeviceCategory> categories = deviceCategoryMapper.selectList(
                 new LambdaQueryWrapper<DeviceCategory>()
         );
+        List<DeviceArchive> devices = deviceArchiveMapper.selectList(
+                new LambdaQueryWrapper<DeviceArchive>()
+        );
+        List<MaintainRecord> maintainRecords = maintainRecordMapper.selectList(
+                new LambdaQueryWrapper<MaintainRecord>()
+        );
+        List<FaultOrder> closedFaultOrders = faultOrderMapper.selectList(
+                new LambdaQueryWrapper<FaultOrder>()
+                        .eq(FaultOrder::getStatus, "closed")
+        );
+
+        Map<String, List<DeviceArchive>> devicesByCategory = devices.stream()
+                .collect(Collectors.groupingBy(DeviceArchive::getCategory));
+        Map<String, BigDecimal> maintainCostByDevice = maintainRecords.stream()
+                .filter(record -> record.getActualCost() != null)
+                .collect(Collectors.groupingBy(
+                        MaintainRecord::getDeviceId,
+                        Collectors.reducing(BigDecimal.ZERO, MaintainRecord::getActualCost, BigDecimal::add)
+                ));
+        Map<String, BigDecimal> repairCostByDevice = closedFaultOrders.stream()
+                .filter(order -> order.getRepairCost() != null)
+                .collect(Collectors.groupingBy(
+                        FaultOrder::getDeviceId,
+                        Collectors.reducing(BigDecimal.ZERO, FaultOrder::getRepairCost, BigDecimal::add)
+                ));
 
         return categories.stream()
                 .map(category -> {
-                    List<DeviceArchive> devices = deviceArchiveMapper.selectList(
-                            new LambdaQueryWrapper<DeviceArchive>()
-                                    .eq(DeviceArchive::getCategory, category.getCode())
-                    );
+                    List<DeviceArchive> categoryDevices = devicesByCategory.getOrDefault(category.getCode(), List.of());
 
-                    if (devices.isEmpty()) {
+                    if (categoryDevices.isEmpty()) {
                         return null;
                     }
 
-                    BigDecimal avgPurchaseCost = devices.stream()
+                    BigDecimal avgPurchaseCost = categoryDevices.stream()
                             .map(DeviceArchive::getPurchaseCost)
-                            .filter(c -> c != null)
+                            .filter(Objects::nonNull)
                             .reduce(BigDecimal.ZERO, BigDecimal::add)
-                            .divide(BigDecimal.valueOf(devices.size()), 2, RoundingMode.HALF_UP);
+                            .divide(BigDecimal.valueOf(categoryDevices.size()), 2, RoundingMode.HALF_UP);
 
-                    BigDecimal avgMaintainCost = BigDecimal.ZERO;
-                    BigDecimal avgRepairCost = BigDecimal.ZERO;
+                    BigDecimal totalMaintainCost = categoryDevices.stream()
+                            .map(device -> maintainCostByDevice.getOrDefault(device.getId(), BigDecimal.ZERO))
+                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+                    BigDecimal totalRepairCost = categoryDevices.stream()
+                            .map(device -> repairCostByDevice.getOrDefault(device.getId(), BigDecimal.ZERO))
+                            .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-                    for (DeviceArchive device : devices) {
-                        BigDecimal maintainCost = maintainRecordMapper.selectList(
-                                new LambdaQueryWrapper<MaintainRecord>()
-                                        .eq(MaintainRecord::getDeviceId, device.getId())
-                        ).stream()
-                                .map(MaintainRecord::getActualCost)
-                                .filter(c -> c != null)
-                                .reduce(BigDecimal.ZERO, BigDecimal::add);
-                        avgMaintainCost = avgMaintainCost.add(maintainCost);
-
-                        BigDecimal repairCost = faultOrderMapper.selectList(
-                                new LambdaQueryWrapper<FaultOrder>()
-                                        .eq(FaultOrder::getDeviceId, device.getId())
-                                        .eq(FaultOrder::getStatus, "closed")
-                        ).stream()
-                                .map(FaultOrder::getRepairCost)
-                                .filter(c -> c != null)
-                                .reduce(BigDecimal.ZERO, BigDecimal::add);
-                        avgRepairCost = avgRepairCost.add(repairCost);
-                    }
-
-                    avgMaintainCost = avgMaintainCost.divide(BigDecimal.valueOf(devices.size()), 2, RoundingMode.HALF_UP);
-                    avgRepairCost = avgRepairCost.divide(BigDecimal.valueOf(devices.size()), 2, RoundingMode.HALF_UP);
+                    BigDecimal avgMaintainCost = totalMaintainCost.divide(BigDecimal.valueOf(categoryDevices.size()), 2, RoundingMode.HALF_UP);
+                    BigDecimal avgRepairCost = totalRepairCost.divide(BigDecimal.valueOf(categoryDevices.size()), 2, RoundingMode.HALF_UP);
                     BigDecimal avgTco = avgPurchaseCost.add(avgMaintainCost).add(avgRepairCost);
 
                     TcoCompareVO vo = new TcoCompareVO();
@@ -511,7 +564,7 @@ public class StatsService {
                     vo.setAvgMaintainCost(avgMaintainCost);
                     vo.setAvgRepairCost(avgRepairCost);
                     vo.setAvgTco(avgTco);
-                    vo.setDeviceCount((long) devices.size());
+                    vo.setDeviceCount((long) categoryDevices.size());
 
                     return vo;
                 })
@@ -526,21 +579,7 @@ public class StatsService {
      */
     public DashboardVO getDashboard() {
         DashboardVO dashboard = new DashboardVO();
-
-        // 概览统计
-        StatsOverviewVO overview = new StatsOverviewVO();
-        overview.setTotalDevices(deviceArchiveMapper.selectCount(
-                new LambdaQueryWrapper<DeviceArchive>()
-        ));
-        overview.setInUseRate(calculateInUseRate());
-        overview.setGoodConditionRate(calculateGoodConditionRate());
-        overview.setFaultRate(calculateFaultRate(LocalDate.now().getYear()));
-        overview.setMaintainCompletionRate(calculateMaintainCompletionRate(LocalDate.now().getYear()));
-        overview.setOrderCloseRate(calculateOrderCloseRate(LocalDate.now().getYear()));
-        overview.setMtbf(calculateMTBF(LocalDate.now().getYear()));
-        overview.setMttr(calculateMTTR(LocalDate.now().getYear()));
-        overview.setTotalOperationCost(calculateTotalOperationCost());
-        dashboard.setOverview(overview);
+        dashboard.setOverview(getOverview());
 
         // 费用趋势
         dashboard.setCostTrend(get30DayCostTrend());

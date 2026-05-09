@@ -15,6 +15,14 @@ export function getDashboard() {
 }
 
 /**
+ * 获取统计概览
+ * @returns {Promise} 统计概览
+ */
+export function getOverview() {
+  return api.get('/stats/overview')
+}
+
+/**
  * 设备在用率
  * @returns {Promise} 在用率
  */

@@ -36,6 +36,15 @@ public class StatsController {
     }
 
     /**
+     * 获取统计概览
+     */
+    @Operation(summary = "获取统计概览")
+    @GetMapping("/overview")
+    public Result<StatsOverviewVO> getOverview() {
+        return Result.success(statsService.getOverview());
+    }
+
+    /**
      * 设备在用率
      */
     @Operation(summary = "设备在用率")
